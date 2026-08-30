@@ -48,6 +48,10 @@ TreeTimeAlign computes a rigid transform with all 6 degrees of freedom that brin
 
 ---
 
+## What this repository DOES NOT contain
+
+The random forest model .rds file used to solve z-shift which can be downloaded from https://drive.google.com/file/d/1BrVXryqYfuhET0DsxE16vf6Sa8uhMOn6/view?usp=drive_link
+
 ## Structure of the workflow
 
 Each stage solves one component of the transform and records it. Each subsequent stage applies the components solved before it, so that it measures the residual misalignment rather than the original: Stage 3 applies the Stage 2 rotation before refitting ellipses, Stage 4 applies the Stage 3 vertical offset before solving the yaw, and Stage 5 applies the Stage 4 yaw before measuring the horizontal displacement. What each stage applies is applied to the fitted geometry it works on, not written back to the cloud.
