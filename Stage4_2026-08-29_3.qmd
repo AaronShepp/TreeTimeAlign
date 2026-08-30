@@ -1,0 +1,2065 @@
+---
+title: "Forest Point Cloud Alignment – Stage 4"
+subtitle: "Solve the Z-only rotation from ellipse-centre line networks"
+author: "Point Cloud Analysis"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    theme: flatly
+    highlight-style: github
+    fig-width: 9
+    fig-height: 6
+    self-contained: true
+execute:
+  warning: false
+  message: false
+  eval: false
+params:
+  make_plots: true
+---
+
+
+# Overview – Stage 4 of 6
+
+Stage 4 **solves the Z-only (yaw) rotation** that best aligns the two epochs in the horizontal plane. It first applies the vertical offset `t_trans_z` that Stage 3 solved but left unapplied – bringing both epochs into one shared absolute-height frame – and then estimates the yaw from the geometry of the ellipse-centre network.
+
+The setup (Steps 4.1-4.3) applies `t_trans_z` to:
+
+1. **the ellipse centres** fitted in Stage 3 – every absolute-height field of the `las_1` ellipses moves by `t_trans_z`, producing `ellipses_zshift_1` / `ellipses_zshift_2`;
+2. **`pivot1`** – producing **`pivot2`**, the pivot in the post-Z-shift frame.
+
+The solve (Steps 4.5-4.9) then works purely on the shifted ellipse centres:
+
+3. **average each tree’s ellipse centres** to one representative XY point per stem, per epoch (4.6);
+4. **build an inter-tree line network** – every pair of stems defines an edge – and measure, for each edge, the angular difference between the epoch-1 and epoch-2 versions of that edge (4.7). A pure yaw rotates every edge by the same angle, so those per-edge differences all estimate the same rotation;
+5. **remove outlier stems** whose edges disagree with the consensus, iteratively by MAD (4.8);
+6. **solve the rotation** as the mean of the surviving edge-wise differences (4.9), recorded as `z_rotation_deg`.
+
+No point clouds are loaded for the solve. The rotation is solved and recorded here but **applied** in Stage 5/6, following the same solve-then-apply split Stage 3 used for the translation. `z_rotation_deg` is the stage’s headline output.
+
+Which fields move, and which deliberately do not
+
+Stage 3's ellipses carry heights in two different frames, and only one of them
+is affected by a rigid vertical translation:
+
+- **Absolute (world) heights** – `center_z`, `global_stem_origin_z`,
+  `stem_len_origin`, `stem_len_abs`. These are real elevations in the shared
+  frame, so every one of them gains `t_trans_z`.
+- **Stem-relative axis coordinates** – `stem_len` and its alias `slice_z`.
+  These measure distance *along that stem's own axis from that stem's own
+  origin*. Translating the whole stem vertically moves the origin by exactly
+  the same amount, so the relative coordinate is unchanged. Shifting it as well
+  would double-count the offset.
+
+`slice_z_global` is (re)built from the post-shift `stem_len_abs`, giving every
+ellipse – from both epochs – a directly comparable elevation in one shared
+frame. That single column is what Stage 5's vertical-profile logic reads.
+
+`las_2` is the fixed reference cloud: it is never shifted, so its absolute
+fields pass through untouched and only gain the `slice_z_global` column.
+
+# Stage 0 - Setup
+
+
+## 0.1 Load libraries
+```{r}
+#| label: setup
+#| code-summary: "Load libraries and set plot theme"
+
+library(lidR)       # LAS I/O and point cloud processing
+library(ggplot2)    # Plotting
+library(dplyr)      # Data wrangling
+library(plotly)     # Interactive 3D figures
+library(tidyr)      # pivot_longer for the before/after centre plot
+library(base64enc)  # Embed rendered plots into HTML galleries
+library(htmltools)  # Assemble the HTML gallery output
+
+# ── Driver-supplied parameter overrides ──────────────────────────────────────
+# Every params-* chunk in this file ends with .par_apply("<its label>"). Run the
+# file by hand and that call does nothing: the values the chunk just assigned
+# stand. Run it under the batch driver, which puts a .batch_params list in the
+# environment before the first chunk, and any entry keyed to that chunk label is
+# assigned here - AFTER the defaults, so the driver's value is the one that
+# survives into the functional chunk that follows.
+#
+# Why this exists. Parameters used to sit in the same chunk as the code that
+# consumed them, so the driver's overrides - which land after a chunk finishes -
+# arrived too late to matter, and every pair silently used the .qmd's hardcoded
+# value. Splitting each chunk in two fixes the ordering; this helper is what the
+# driver reaches through.
+#
+# The defaults stay in this file rather than moving into the driver. They are
+# the single definition, the driver names only what a batch changes, and there
+# is no second copy of ~670 parameters to drift out of step with this one.
+#
+# envir = parent.frame() so a call at chunk top level lands in the environment
+# the chunk is being evaluated in - globalenv by hand, the pair environment
+# under the driver - without needing .stage_env(), which is defined further down.
+.par_apply <- function(label, envir = parent.frame()) {
+  bp <- mget(".batch_params", envir = envir, ifnotfound = list(NULL),
+             inherits = TRUE)[[1]]
+  if (is.null(bp) || is.null(bp[[label]])) return(invisible(character(0)))
+  vals <- bp[[label]]
+  if (!length(vals)) return(invisible(character(0)))
+  if (is.null(names(vals)) || any(!nzchar(names(vals))))
+    stop(sprintf("[.par_apply] .batch_params[['%s']] must be a fully NAMED list.", label))
+  # A name the chunk did not define is almost always a typo or a rename in the
+  # .qmd that the driver has not caught up with. Silence there would mean the
+  # batch runs on the default while looking like it was overridden, so it stops.
+  unknown <- names(vals)[!vapply(names(vals), exists, logical(1),
+                                 envir = envir, inherits = FALSE)]
+  if (length(unknown))
+    stop(sprintf(paste0("[.par_apply] %s: %d override(s) name nothing this chunk assigns:\n  %s\n",
+                        "  Fix the name in the driver's .build_params(), or remove it."),
+                 label, length(unknown), paste(unknown, collapse = "\n  ")))
+  for (nm in names(vals)) assign(nm, vals[[nm]], envir = envir)
+  cat(sprintf("  [params] %s <- driver (%s)\n", label, paste(names(vals), collapse = ", ")))
+  invisible(names(vals))
+}
+```
+
+## 0.2 Global Helpers
+```{r}
+#| label: params-helpers
+#| code-summary: "Parameters - Colours, ggplot theme, stage save/load utilities, and the on-demand point-cloud loader"
+
+# ============================================================
+# Colours
+# ============================================================
+COL_1     <- "#2196F3"
+COL_2     <- "#FF5722"
+COL_MATCH <- "#D9F9A5"
+
+# ============================================================
+# Progress bars
+#
+# Thin wrappers around cli, using EXACTLY the idiom Stage 3's axis-RANSAC fit
+# has always used, because that one works when these documents are run on their
+# own. Their only job is to save repeating the same six lines at every long
+# loop.
+#
+# THE ONE THING THAT MUST NOT BE CHANGED HERE is `.envir = parent.frame()`.
+# cli ties a progress bar's lifetime to a frame and tears the bar down when
+# that frame exits. .pb_new() is a function, so a bar created with cli's
+# default `.envir` would be created and immediately destroyed the moment
+# .pb_new returned - the loop then ticks a bar that no longer exists and
+# nothing is ever drawn. parent.frame() hands the bar to the CALLER's frame,
+# which is the loop, and is the difference between this working and silently
+# doing nothing. (An earlier revision passed globalenv() here, which is why the
+# bars added through this helper never appeared while the hand-written ones in
+# 3.3, 3.6 and 3.9 did.)
+#
+# Under the batch driver these will NOT be visible: cli draws on stderr, and
+# the driver holds a message sink, which cannot be split. That is expected and
+# is not worked around here - the driver prints its own progress instead.
+# ============================================================
+# Progress bars
+# ============================================================
+# One set of helpers, two renderers, chosen at the moment a bar is created.
+#
+#   cli    a redrawing bar, when there is a terminal able to show one
+#   lines  one ordinary printed line per update, when there is not
+#
+# The choice is not cosmetic. cli draws on STDERR, and the batch driver holds a
+# sink(type = "message"), which cannot split - so under the driver a cli bar
+# goes to the log file and nowhere else, arriving as carriage returns and
+# escape codes wrapped around each other. That is what the last run's log shows
+# for every fitting step except the library's own: minutes of work with nothing
+# on screen, and an unreadable smear in the log afterwards.
+#
+# The printed-line renderer is what the RANSAC library's cat handler already
+# does, and it is the one visible line in that log. Same format here, so a fit
+# reports identically whether the progress comes from the library or from a
+# loop in this file.
+show_progress_bars <- TRUE
+
+# Print at most one line per 5% of the total or per 15 seconds, whichever comes
+# first, plus always the first and last. A 20-stem fit gives ~20 lines; a
+# 5000-slice loop does not give 5000.
+progress_step_frac    <- 0.05
+progress_min_seconds  <- 15
+
+.par_apply("params-helpers")
+```
+
+```{r}
+#| label: helpers
+#| code-summary: "Colours, ggplot theme, stage save/load utilities, and the on-demand point-cloud loader"
+
+# ============================================================
+# ggplot theme
+# ============================================================
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title       = element_text(face = "bold"),
+      legend.position  = "bottom"
+    )
+)
+.write_las_snapshot <- function(las_template, xyz_mat, output_path, stage_label) {
+  las_snap        <- las_template
+  las_snap@data$X <- xyz_mat[, 1]
+  las_snap@data$Y <- xyz_mat[, 2]
+  las_snap@data$Z <- xyz_mat[, 3]
+
+  # Make output_path unique if the file already exists (appends _001, _002, ...)
+  if (file.exists(output_path)) {
+    base_noext <- tools::file_path_sans_ext(output_path)
+    ext        <- tools::file_ext(output_path)
+    counter    <- 1L
+    repeat {
+      candidate <- sprintf("%s_%03d.%s", base_noext, counter, ext)
+      if (!file.exists(candidate)) { output_path <- candidate; break }
+      counter <- counter + 1L
+    }
+    cat(sprintf("Output file already exists - using unique name: %s\n", output_path))
+  }
+
+  writeLAS(las_snap, output_path)
+  cat(sprintf("[%s] Saved %s points -> %s\n",
+              stage_label, format(nrow(xyz_mat), big.mark = ","), output_path))
+  invisible(output_path)
+}
+angle_from_x_ccw <- function(dx, dy) atan2(dy, dx) * 180 / pi
+
+
+# ============================================================
+# Stage save/load utilities – shared by every stage file.
+#
+# Contract (identical in all six stage files):
+# SAVE → hard ERROR if any *required* object is missing from the
+# environment, so a checkpoint can never be written half-empty.
+# A *warning* is raised for any missing *optional* object
+# (diagnostic products that may legitimately not have been run);
+# those are simply omitted from the file.
+# LOAD → never errors on content. A *warning* is raised for each
+# requested object that is absent from the RDS. Objects present in
+# the RDS but not requested are COUNTED in the summary line and
+# never listed. Everything found in the file is loaded either way,
+# so nothing is silently discarded.
+# PATHS → a save never overwrites: if the target path exists, a numeric
+# suffix (_001, _002, ...) is appended until the name is free.
+# ============================================================
+
+#' Return `path` if free, otherwise path_001 / path_002 / ... (first free one).
+.unique_path <- function(path) {
+  if (!file.exists(path)) return(path)
+  base_noext <- tools::file_path_sans_ext(path)
+  ext        <- tools::file_ext(path)
+  counter    <- 1L
+  repeat {
+    candidate <- sprintf("%s_%03d.%s", base_noext, counter, ext)
+    if (!file.exists(candidate)) {
+      cat(sprintf("Target already exists - using unique name: %s\n", candidate))
+      return(candidate)
+    }
+    counter <- counter + 1L
+  }
+}
+
+#' Which environment do the stage helpers read and write?
+#'
+#' A .qmd rendered or run by hand evaluates its chunks in the global
+#' environment. The batch driver does not: it gives every LAS pair a fresh
+#' environment of its own, so that a leftover object from the previous pair
+#' cannot be picked up by one of the exists() guards this pipeline is full of.
+#' Under the driver, everything the stages assign therefore lives THERE, and
+#' not in globalenv.
+#'
+#' parent.env(environment()) is the environment this chunk was evaluated in:
+#' globalenv() by hand, the pair environment under the driver. It is resolved
+#' from where .stage_env was DEFINED rather than from where it is called, so it
+#' returns the same environment inside a function as it does at chunk top
+#' level, and nothing has to be told which mode it is in.
+#'
+#' This replaced a hardcoded .stage_env() throughout. Under the driver that
+#' pointed at an environment the pipeline had never written to, so every object
+#' in a save manifest read as missing and the checkpoint refused to write - the
+#' Stage 1 failure that reported 30 missing required objects after a 64-minute
+#' fit. (`run_counts` was the one it did find, and only because .tally()'s `<<-`
+#' walked past the pair environment into globalenv. That is fixed below too.)
+.stage_env <- function() parent.env(environment())
+
+#' Is a batch driver running this file?
+#'
+#' The driver assigns .batch_mode <- TRUE into the pair environment before the
+#' first chunk runs. It changes one thing, and only for the checkpoints: in a
+#' batch, every stage runs in ONE session, so Stage N+1 already holds in memory
+#' everything Stage N computed and never has to read it back off disk. The
+#' checkpoints stop being load-bearing and become a record of the run.
+#'
+#' So under a batch: nothing in a manifest is required (a missing object is
+#' reported and left out, and the pair carries on), a failed write is reported
+#' rather than thrown, and .stage_load is a no-op. Run the same .qmd by hand and
+#' every one of those is an error again, which is what it should be when the
+#' checkpoint is the only thing carrying the stage forward.
+.in_batch <- function() {
+  isTRUE(mget(".batch_mode", envir = .stage_env(),
+              ifnotfound = list(FALSE), inherits = FALSE)[[1]])
+}
+
+#' Read one of the driver's batch settings out of the pair environment.
+#' Absent - i.e. this file is being run by hand - gives `default`.
+.batch_opt <- function(name, default = NULL) {
+  v <- mget(name, envir = .stage_env(), ifnotfound = list(NULL), inherits = FALSE)[[1]]
+  if (is.null(v)) default else v
+}
+
+#' Where a checkpoint goes when a batch is running.
+#'
+#' Every save chunk in this pipeline assigns its .rds path and then USES it a
+#' few lines later, in the same chunk. The driver applies its overrides AFTER a
+#' chunk has run, so an override of stage1_rds_path arrives after the file has
+#' already been written to the path hardcoded here - which means, without this,
+#' every sample in a batch writes over the same hardcoded name.
+#'
+#' So in batch mode the destination is derived instead, from two values the
+#' driver puts in the environment before anything runs: .batch_rds_dir and
+#' .batch_sample. The label the save chunk already passes supplies the rest, so
+#' "Stage 3.2" becomes <dir>/<sample>_Stage3_2.rds with nothing to keep in sync.
+#'
+#' NULL means: not in a batch, or the driver did not set the directory - use the
+#' path the chunk asked for.
+.batch_rds_path <- function(label) {
+  dir <- .batch_opt(".batch_rds_dir")
+  smp <- .batch_opt(".batch_sample")
+  if (is.null(dir) || is.null(smp)) return(NULL)
+  file.path(dir, sprintf("%s_%s.rds", smp,
+                         gsub("\\.", "_", gsub("\\s+", "", label))))
+}
+
+#' Save a stage checkpoint. Errors on missing required objects - unless the
+#' batch driver is running this file, in which case nothing is required, the
+#' destination is the per-sample one derived above, and a failure to write is
+#' reported rather than thrown. See .in_batch() above.
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+.stage_save <- function(path, required, optional = character(0),
+                        label = "stage", envir = .stage_env(),
+                        strict = !.in_batch()) {
+
+  required <- unique(required)
+  optional <- setdiff(unique(optional), required)
+
+  # A batch may switch an individual checkpoint off by label - the driver's
+  # keep_stage3_fit_checkpoint does exactly this for "Stage 3.1", whose chunk
+  # must still RUN (the final Stage 3 manifest inherits from it) but need not
+  # write a second large file per sample.
+  if (!strict && label %in% .batch_opt(".batch_skip_saves", character(0))) {
+    cat(sprintf("[%s save] Skipped - switched off for this batch.\n", label))
+    return(invisible(NA_character_))
+  }
+
+  # inherits = FALSE, matching the mget() below, which has always been strict.
+  # With inheritance on, an object could be FOUND in a parent environment and
+  # then fail to be FETCHED, and under the driver the parent is globalenv -
+  # i.e. the previous pair's leftovers.
+  .have <- function(x)
+    if (!length(x)) logical(0)
+    else vapply(x, exists, logical(1), envir = envir, inherits = FALSE)
+
+  missing_req <- required[!.have(required)]
+  if (length(missing_req) > 0L) {
+    if (strict)
+      stop(sprintf(
+        "[%s save] Cannot save - %d required object(s) missing from the environment:\n  %s",
+        label, length(missing_req), paste(missing_req, collapse = "\n  ")))
+    cat(sprintf(
+      "[%s save] %d required object(s) missing - treated as optional and omitted (batch mode):\n  %s\n",
+      label, length(missing_req), paste(missing_req, collapse = "\n  ")))
+  }
+
+  missing_opt <- optional[!.have(optional)]
+  if (length(missing_opt) > 0L) {
+    msg <- sprintf(
+      "[%s save] %d optional object(s) missing - omitted from the checkpoint:\n  %s",
+      label, length(missing_opt), paste(missing_opt, collapse = "\n  "))
+    if (strict) warning(msg) else cat(msg, "\n", sep = "")
+  }
+
+  present  <- c(setdiff(required, missing_req), setdiff(optional, missing_opt))
+  n_opt_in <- length(setdiff(optional, missing_opt))
+  dat      <- mget(present, envir = envir, inherits = FALSE)
+
+  # ── The checkpoint describes itself ────────────────────────────────────────
+  # The manifest travels INSIDE the file. Without it, loading a checkpoint means
+  # first reconstructing the exact `required`/`optional` vectors it was written
+  # with - and those are built by chunks, so a later checkpoint could only be
+  # loaded after running the chunks that define an earlier one's manifest. That
+  # made resuming from an arbitrary point in a fresh session impossible: the
+  # Stage 3.2 chunk, for instance, stops outright unless .stage3_1_required is
+  # already in scope.
+  #
+  # Stored under a name no manifest can collide with, and stripped again on
+  # load, so it never reaches the session as an object.
+  dat[[".__manifest__"]] <- list(
+    required = setdiff(required, missing_req),
+    optional = setdiff(optional, missing_opt),
+    label    = label,
+    saved_utc = format(Sys.time(), tz = "UTC", usetz = TRUE))
+
+  .write <- function() {
+    p <- path
+    if (!strict) {
+      bp <- .batch_rds_path(label)
+      if (!is.null(bp)) p <- bp
+    }
+    dir.create(dirname(p), recursive = TRUE, showWarnings = FALSE)
+    # .unique_path only interactively. A batch path already carries the sample
+    # name, so it cannot collide with another sample, and a re-run of the same
+    # sample should REPLACE its checkpoint rather than leave _001, _002 behind
+    # for the next reader to guess between.
+    if (strict) p <- .unique_path(p)
+    saveRDS(dat, p)
+    cat(sprintf("[%s save] Saved %d object(s) (%d required, %d optional) -> %s\n",
+                label, length(dat), length(present) - n_opt_in, n_opt_in, p))
+    p
+  }
+
+  if (strict) return(invisible(.write()))
+
+  out <- tryCatch(.write(), error = function(e) {
+    cat(sprintf("[%s save] Checkpoint NOT written: %s\n", label, conditionMessage(e)))
+    cat(sprintf("[%s save] Batch mode - the objects are still in this session, so the run continues.\n",
+                label))
+    NA_character_
+  })
+  invisible(out)
+}
+
+#' Load a stage checkpoint. Warns (never errors) on content mismatches, and
+#' under the batch driver does not read at all - see .in_batch() above.
+.stage_load <- function(path, required, optional = character(0),
+                        label = "stage", envir = .stage_env(),
+                        strict = !.in_batch()) {
+
+  # In a batch the objects this would read are already live in `envir`, put
+  # there by the stage that just ran. Reading them back would at best be a
+  # no-op. At worst it would be wrong: checkpoint paths are per-sample and
+  # .unique_path() means a re-run writes _001 rather than replacing the
+  # original, so the path named here can easily be an EARLIER run's file. And
+  # if the write failed or was partial, there would be nothing to read and the
+  # pair would die at the start of the next stage having done all the work.
+  if (!strict) {
+    cat(sprintf("[%s load] Skipped - batch mode: this stage's objects are already in the session.\n",
+                label))
+    return(invisible(character(0)))
+  }
+
+  if (!file.exists(path))
+    stop(sprintf("[%s load] File not found:\n  %s", label, path))
+
+  dat <- readRDS(path)
+
+  # ── Prefer the manifest the file carries ───────────────────────────────────
+  # A checkpoint written by .stage_save records what it holds, so a load needs
+  # nothing from the session - no earlier chunk, no earlier checkpoint, no
+  # reconstructed name vectors. `required` and `optional` become a CHECK against
+  # what the caller expected rather than the definition of what to read, which
+  # is what lets any stage be resumed from any checkpoint in a fresh session.
+  #
+  # Files written before manifests existed simply have none; those fall back to
+  # the caller's vectors, exactly as before.
+  mf <- dat[[".__manifest__"]]
+  dat[[".__manifest__"]] <- NULL
+  caller_req <- unique(required)
+  caller_opt <- setdiff(unique(optional), caller_req)
+
+  if (!is.null(mf)) {
+    required <- unique(mf$required)
+    optional <- setdiff(unique(mf$optional), required)
+    src <- sprintf("its own manifest (written %s)", mf$saved_utc %||% "?")
+  } else {
+    required <- caller_req; optional <- caller_opt
+    src <- "the caller's manifest - this file predates self-describing checkpoints"
+  }
+  expected <- c(required, optional)
+
+  cat(sprintf("[%s load] Reading %d object(s) from: %s\n",
+              label, length(dat), path))
+  cat(sprintf("[%s load] Manifest: %s\n", label, src))
+
+  # Named by the caller but absent from the file: the real incompatibility, and
+  # the only one worth a warning when the file describes itself.
+  if (!is.null(mf)) {
+    unmet <- setdiff(caller_req, names(dat))
+    if (length(unmet))
+      warning(sprintf(
+        "[%s load] %d object(s) this stage expects are not in the checkpoint:\n  %s",
+        label, length(unmet), paste(unmet, collapse = "\n  ")))
+  }
+
+  missing_req <- required[!required %in% names(dat)]
+  if (length(missing_req) > 0L)
+    warning(sprintf(
+      "[%s load] %d REQUIRED object(s) absent from the RDS - downstream chunks that use them will fail:\n  %s",
+      label, length(missing_req), paste(missing_req, collapse = "\n  ")))
+
+  missing_opt <- optional[!optional %in% names(dat)]
+  if (length(missing_opt) > 0L)
+    warning(sprintf(
+      "[%s load] %d optional object(s) absent from the RDS:\n  %s",
+      label, length(missing_opt), paste(missing_opt, collapse = "\n  ")))
+
+  # Unrequested objects are COUNTED, never listed. Every checkpoint from Stage 2
+  # onward is cumulative, so this set is routinely hundreds of names long and
+  # printing it buried the two messages that actually matter - an absent
+  # required object, and an absent optional one - under a wall of text. The
+  # count still appears in the summary line below, which is the only part of it
+  # anyone reads.
+  extra <- setdiff(names(dat), expected)
+
+  # ── Publish what was loaded, for the next stage's save manifest ────────────
+  # Every stage's SAVE manifest is built as "the previous stage's manifest, plus
+  # my own objects", and the previous manifest is a vector defined by that
+  # stage's LOAD chunk. Load a LATER checkpoint directly and that chunk never
+  # runs, so the save dies on a missing .stageN_required - which is exactly the
+  # resume-from-anywhere case these checkpoints now exist to support.
+  #
+  # Recording the manifest here breaks the dependency: .manifest_from() below
+  # falls back to whatever was actually loaded, whichever chunk did it.
+  assign(".stage_last_manifest",
+         list(required = required, optional = optional,
+              names = names(dat), label = label, path = path),
+         envir = envir)
+
+  list2env(dat, envir = envir)
+
+  cat(sprintf("[%s load] Loaded %d object(s) | required present: %d/%d | optional present: %d/%d | unrequested: %d\n",
+              label, length(dat),
+              length(required) - length(missing_req), length(required),
+              length(optional) - length(missing_opt), length(optional),
+              length(extra)))
+  invisible(names(dat))
+}
+
+#' The manifest a save chunk inherits from the stage before it.
+#'
+#' Looks for the named vector first - that is the normal path, when this
+#' session's own load chunk built it. Falls back to the manifest carried by
+#' whichever checkpoint was last loaded, which is what makes it possible to load
+#' any checkpoint and still save the next one.
+#'
+#' `which` is "required" or "optional". Stops with something actionable rather
+#' than returning character(0): a save that silently inherits nothing writes a
+#' checkpoint missing every object from every earlier stage, and nothing would
+#' notice until a later stage failed to find them.
+.manifest_from <- function(name, which = c("required", "optional"),
+                           envir = .stage_env()) {
+  which <- match.arg(which)
+  if (exists(name, envir = envir, inherits = FALSE))
+    return(get(name, envir = envir, inherits = FALSE))
+
+  lm <- if (exists(".stage_last_manifest", envir = envir, inherits = FALSE))
+          get(".stage_last_manifest", envir = envir, inherits = FALSE) else NULL
+
+  if (!is.null(lm)) {
+    cat(sprintf("[manifest] %s not in the session - inheriting from the %s checkpoint that was loaded.\n",
+                name, lm$label))
+    # For "required", everything the loaded file actually held is the honest
+    # inheritance: it is what this session has, regardless of how the file that
+    # produced it split required from optional.
+    return(if (identical(which, "required")) lm$names else character(0))
+  }
+
+  # ── Last resort: the session itself ────────────────────────────────────────
+  # No named vector and no checkpoint loaded. That is the ordinary case for a
+  # session built by RUNNING chunks rather than by loading - Stage 1 through
+  # Stage 3 straight down the document, or an interactive session where the
+  # objects were produced rather than read. There is nothing wrong with it, and
+  # a save must not refuse.
+  #
+  # So fall back to what Stages 4 and 5 have always done: take the manifest from
+  # the environment. Every non-function, non-dotted object in scope is what this
+  # stage inherited, by definition - it is the same rule, just applied later.
+  #
+  # Only "required" gets this. Optional means "save it if it happens to exist",
+  # which is meaningless once the list IS everything that exists.
+  if (identical(which, "required")) {
+    nm <- setdiff(ls(envir = envir), lsf.str(envir = envir))
+    nm <- nm[!startsWith(nm, ".")]
+    if (length(nm)) {
+      cat(sprintf(paste0("[manifest] %s not found and no checkpoint was loaded - taking the manifest\n",
+                         "           from the session instead (%d object(s)). This is the normal path\n",
+                         "           when the stage was RUN rather than loaded.\n"), name, length(nm)))
+      return(nm)
+    }
+  } else {
+    return(character(0))
+  }
+
+  stop(sprintf(paste0("[manifest] %s not found, no checkpoint has been loaded, and the session is\n",
+                      "  empty - there is nothing to save. Run this stage's chunks, or load a\n",
+                      "  checkpoint, before the save chunk."), name))
+}
+
+#' Print the Stage 1 pivot point.
+.report_pivot1 <- function() {
+  if (exists("pivot1")) {
+    cat(sprintf("pivot1 (Stage 1 footprint centre): (%.4f, %.4f, %.4f)\n",
+                pivot1[1], pivot1[2], pivot1[3]))
+  } else {
+    cat("pivot1 NOT available.\n")
+  }
+}
+
+# ============================================================
+# Stages 2, 4 and 5 deliberately never load point clouds - they work purely on
+# fitted ellipse geometry, which is what keeps them cheap to re-run. A handful
+# of 3-D figures in those stages genuinely need raw points, so each of those
+# chunks carries its own loader at the top, controlled by one toggle.
+#
+# Stage 3 carries it too, for a different reason: it DOES load the clouds at the
+# top, but releases them again part-way through, and resuming from the Stage 3
+# post-fit checkpoint skips the load entirely.
+#
+# Stages 1 and 6 do NOT have this block at all - they load the clouds up front
+# and keep them for the whole stage, so nothing there would ever call it.
+#
+#   vis_load_clouds <- TRUE    read las_1 / las_2 from disk
+#   vis_load_clouds <- FALSE   reuse whatever is already resident in memory
+#
+# Set it FALSE when the clouds are already loaded - you just ran Stage 3 in the
+# same session, or an earlier figure in this stage already loaded them. Reading
+# a multi-gigabyte LAS once per figure is slow and pointless. Leave it TRUE when
+# running the stage standalone from its checkpoint, which is the normal case.
+#
+# ── FRAMES: why las_1 needs a rotation the moment it comes off disk ────────────
+# las_1 sits on disk in the ORIGINAL scan frame. Stage 1A's rough vertical
+# alignment (R_align_1 about align_pivot_1) was applied to las_1 IN MEMORY in
+# Stage 1 and never written back - there is no writeLAS anywhere in Stage 1. So
+# every measurement made downstream of Stage 1A - ellipse centres, per-stem axis
+# vectors, pivot1, and the Stage 2 rotation solve R_xyz - live in the ALIGNED
+# frame, not the disk frame. A figure that reads las_1 off disk and overlays any
+# of that geometry is mixing two frames unless it first reapplies R_align_1.
+#
+# This loader therefore reconstructs the pipeline frame for las_1 as a stack of
+# rigid steps, matching the Stage 2 composition (R_align_xyz_1) exactly:
+#
+#   x_aligned = R_align_1 (x_raw     - align_pivot_1) + align_pivot_1   (apply_align, Stage 1A)
+#   x_final   = R_xyz     (x_aligned - pivot1)        + pivot1          (apply_rot,   Stage 2)
+#   x_final  += t_trans_z                                              (apply_zshift, Stage 4)
+#   x_final   = R_z-only  about pivot2 in XY                            (apply_zrot,   Stage 5)
+#
+# apply_align is the default-ON baseline: everything above stacks on the
+# aligned frame, so leaving it on is what makes las_1 line up with the ellipses
+# and vectors. Turn it OFF only to inspect the raw disk cloud deliberately.
+# las_2 is the REFERENCE cloud - Stage 1 never rotates it and its ellipses are in
+# the disk frame - so it is never transformed here.
+#
+# Transforms are applied to the RETURNED point frame, never baked back into the
+# LAS object, so repeated calls (or a load = FALSE reuse) can never compound.
+# ============================================================
+
+#' Make point clouds available to one visualisation chunk.
+#'
+#' @param load         TRUE to read from disk; FALSE to reuse las_1 / las_2
+#'                     already in the global environment.
+#' @param las_1_path,las_2_path
+#'                     Optional explicit source paths. When NULL (default) the
+#'                     paths are taken from the global environment, so a caller
+#'                     can either pass them or rely on the checkpoint. Only used
+#'                     when load = TRUE.
+#' @param apply_align  reapply the Stage 1A rough vertical alignment to las_1
+#'                     (R_align_1 about align_pivot_1). Default TRUE: this is the
+#'                     baseline frame every Stage 1/2 measurement lives in, so
+#'                     without it the returned las_1 points do NOT match the
+#'                     ellipses or axis vectors. Set FALSE only to see the raw
+#'                     on-disk cloud. No-op (identity) when rough alignment was
+#'                     not run; skipped with a note if the checkpoint lacks the
+#'                     objects.
+#' @param apply_rot    rebuild the Stage 2 XYZ rotation R_xyz (about pivot1),
+#'                     stacked on the aligned frame.
+#' @param apply_zshift rebuild the Stage 4 Z-translation.
+#' @param apply_zrot   rebuild the Stage 5 Z-only rotation (about pivot2 in XY).
+#' @param need_las2    FALSE to skip the reference cloud entirely.
+#'
+#' @return list(las_1, las_2, pts_1, pts_2, xyz_1, state). pts_* are plain data
+#'   frames of X/Y/Z/TreeID with TreeID 0 and NA dropped (figures show stems).
+#'   xyz_1 / pts_1 are in the transformed frame; the LAS objects stay on-disk.
+.vis_point_clouds <- function(load,
+                              las_1_path   = NULL,
+                              las_2_path   = NULL,
+                              apply_align  = TRUE,
+                              apply_rot    = FALSE,
+                              apply_zshift = FALSE,
+                              apply_zrot   = FALSE,
+                              need_las2    = TRUE,
+                              quiet        = FALSE,
+                              envir        = .stage_env()) {
+
+  .say <- function(...) if (!quiet) cat(...)
+  .g   <- function(nm) get(nm, envir = envir)
+  .has <- function(nm) exists(nm, envir = envir)
+
+  # Resolve source paths: explicit argument wins, else the global/checkpoint.
+  .p1 <- if (!is.null(las_1_path)) las_1_path else
+         if (.has("las_1_path")) .g("las_1_path") else NULL
+  .p2 <- if (!is.null(las_2_path)) las_2_path else
+         if (.has("las_2_path")) .g("las_2_path") else NULL
+
+  if (isTRUE(load)) {
+
+    if (is.null(.p1))
+      stop("[vis loader] las_1_path not supplied and not in the environment - ",
+           "pass it or load this stage's checkpoint first.")
+
+    .say(sprintf("[vis loader] Reading las_1 from disk: %s\n", basename(.p1)))
+    l1 <- lidR::readLAS(.p1)
+    if (lidR::is.empty(l1)) stop("[vis loader] las_1 read as empty: ", .p1)
+    l1 <- lidR::add_lasattribute(l1, x = seq_len(nrow(l1@data)),
+                                 name = "point_id", desc = "Unique ID for las_1 points")
+    l2 <- NULL
+    if (need_las2) {
+      if (is.null(.p2))
+        stop("[vis loader] las_2_path not supplied and not in the environment.")
+      .say(sprintf("[vis loader] Reading las_2 from disk: %s\n", basename(.p2)))
+      l2 <- lidR::readLAS(.p2)
+      if (lidR::is.empty(l2)) stop("[vis loader] las_2 read as empty: ", .p2)
+      l2 <- lidR::add_lasattribute(l2, x = seq_len(nrow(l2@data)),
+                                   name = "point_id", desc = "Unique ID for las_2 points")
+    }
+
+    assign("las_1", l1, envir = envir)
+    if (!is.null(l2)) assign("las_2", l2, envir = envir)
+
+  } else {
+
+    if (!.has("las_1"))
+      stop("[vis loader] vis_load_clouds = FALSE but las_1 is not in memory. Set it TRUE.")
+    if (need_las2 && !.has("las_2"))
+      stop("[vis loader] vis_load_clouds = FALSE but las_2 is not in memory. Set it TRUE.")
+
+    l1 <- .g("las_1")
+    l2 <- if (need_las2) .g("las_2") else NULL
+    .say("[vis loader] Reusing the point clouds already in memory (no disk read).\n")
+  }
+
+  # ── Rebuild the transform state (las_1 only; las_2 is never transformed) ──────
+  # The stack runs in pipeline order on the RETURNED frame: Stage 1A align first,
+  # then the Stage 2 rotation, then the Stage 4/5 shifts. Each step is a rigid
+  # transform about the pivot the corresponding stage used, matching the Stage 2
+  # composition. IDENTICAL in Stages 2, 3, 4 and 5 - if it is edited, edit all four.
+  xyz   <- as.matrix(l1@data[, c("X", "Y", "Z")])
+  state <- character(0)
+
+  # ── Stage 1A: rough vertical alignment (raw disk -> aligned frame) ────────────
+  if (isTRUE(apply_align)) {
+    if (!.has("R_align_1") || !.has("align_pivot_1")) {
+      .say("[vis loader] R_align_1 / align_pivot_1 not in the checkpoint - ",
+           "las_1 left in the raw disk frame (no Stage 1A alignment).\n")
+    } else {
+      Ra <- .g("R_align_1"); pa <- as.numeric(.g("align_pivot_1"))
+      xyz <- sweep(t(Ra %*% t(sweep(xyz, 2, pa))), 2, -pa)
+      # Angle of the rigid rotation, for the log only: acos((tr(R) - 1) / 2).
+      .ang_a <- acos(max(-1, min(1, (sum(diag(Ra)) - 1) / 2))) * 180 / pi
+      state  <- c(state, sprintf("stage-1A align %.4f deg about align_pivot_1", .ang_a))
+    }
+  }
+
+  # ── Stage 2: XYZ rotation R_xyz about pivot1 (aligned -> final) ───────────────
+  if (isTRUE(apply_rot)) {
+    if (!.has("R_xyz") || !.has("pivot1"))
+      stop("[vis loader] apply_rot = TRUE but R_xyz / pivot1 not found - run the ",
+           "Stage 2 rotation solve first, or reload a checkpoint that carries them.")
+    R  <- .g("R_xyz"); pv <- as.numeric(.g("pivot1"))
+    xyz <- sweep(t(R %*% t(sweep(xyz, 2, pv))), 2, -pv)
+    .ang_x <- if (.has("angle_xyz")) .g("angle_xyz") else
+              acos(max(-1, min(1, (sum(diag(R)) - 1) / 2))) * 180 / pi
+    state <- c(state, sprintf("xyz-rot %.4f deg about pivot1", .ang_x))
+  }
+
+  if (isTRUE(apply_zshift)) {
+    tz <- if (.has("t_trans_z_applied")) .g("t_trans_z_applied") else .g("t_trans_z")
+    xyz[, 3] <- xyz[, 3] + tz
+    state <- c(state, sprintf("z-shift %+.4f m", tz))
+  }
+
+  if (isTRUE(apply_zrot)) {
+    # Same sign flip the Stage 5 / Stage 6 builders use: z_rotation_deg is held
+    # in the standard CCW-positive convention, the 2x2 fill below evaluates to
+    # the matrix for -a, so the angle is negated exactly once here.
+    a  <- -.g("z_rotation_deg") * pi / 180
+    Rz <- matrix(c(cos(a), -sin(a), sin(a), cos(a)), 2, 2)
+    pv <- if (.has("pivot2")) .g("pivot2") else .g("pivot1")
+    xc <- xyz[, 1] - pv[1]; yc <- xyz[, 2] - pv[2]
+    xyz[, 1] <- Rz[1, 1] * xc + Rz[1, 2] * yc + pv[1]
+    xyz[, 2] <- Rz[2, 1] * xc + Rz[2, 2] * yc + pv[2]
+    state <- c(state, sprintf("z-rot %+.4f deg", .g("z_rotation_deg")))
+  }
+
+  pts_1 <- data.frame(X = xyz[, 1], Y = xyz[, 2], Z = xyz[, 3], TreeID = l1@data$TreeID)
+  pts_1 <- pts_1[!is.na(pts_1$TreeID) & pts_1$TreeID != 0L, ]
+
+  pts_2 <- NULL
+  if (!is.null(l2)) {
+    pts_2 <- data.frame(X = l2@data$X, Y = l2@data$Y, Z = l2@data$Z, TreeID = l2@data$TreeID)
+    pts_2 <- pts_2[!is.na(pts_2$TreeID) & pts_2$TreeID != 0L, ]
+  }
+
+  .say(sprintf("[vis loader] las_1 state: %s\n",
+               if (length(state)) paste(state, collapse = " + ") else "as loaded (no transform)"))
+  .say(sprintf("[vis loader] stem points available - las_1: %s | las_2: %s\n",
+               format(nrow(pts_1), big.mark = ","),
+               if (is.null(pts_2)) "not loaded" else format(nrow(pts_2), big.mark = ",")))
+
+  invisible(list(las_1 = l1, las_2 = l2, pts_1 = pts_1, pts_2 = pts_2,
+                 xyz_1 = xyz, state = state))
+}
+
+# ============================================================
+# Run tally - one cumulative record of how many things survived each filter
+#
+# Every stage prints its own counts, but those printouts vanish with the render
+# and cannot be compared across runs. .tally() writes the same numbers into a
+# single named list, `run_counts`, that travels in the checkpoints and is read
+# out whole by the Stage 6 error report. A run then answers "how many pairs
+# reached the Z-translation" without anyone re-reading five HTML files.
+#
+# Cumulative and idempotent: each call updates only the keys it names, so
+# re-running one chunk refreshes that chunk's numbers and leaves the rest alone.
+# It never errors - a tally is bookkeeping, and a missing count must not be able
+# to stop a stage from saving.
+# ============================================================
+.tally <- function(...) {
+  vals <- list(...)
+  e    <- .stage_env()
+  base <- if (exists("run_counts", envir = e, inherits = FALSE))
+            get("run_counts", envir = e) else list()
+  assign("run_counts", utils::modifyList(base, vals), envir = e)
+  invisible(get("run_counts", envir = e))
+}
+
+
+#' TRUE when a cli bar can actually be seen.
+#'
+#' All four conditions matter: cli absent, output being knitted, a message sink
+#' in the way (the batch driver), or a terminal that cannot redraw - any one of
+#' them and the bar is invisible, mangled, or both.
+.pb_cli_usable <- function() {
+  isNamespaceLoaded("cli") || requireNamespace("cli", quietly = TRUE)
+  requireNamespace("cli", quietly = TRUE) &&
+    !isTRUE(getOption("knitr.in.progress")) &&
+    sink.number(type = "message") == 0L &&
+    isTRUE(try(cli::is_dynamic_tty(), silent = TRUE))
+}
+
+.pb_fmt_dur <- function(s) {
+  if (!is.finite(s)) return("--")
+  if (s < 90) sprintf("%.0fs", s) else if (s < 5400) sprintf("%.1fm", s / 60)
+  else sprintf("%.1fh", s / 3600)
+}
+
+#' Start a bar. Returns an opaque handle for .pb_tick()/.pb_done(), or NULL.
+#'
+#' .envir = parent.frame() is load-bearing for the cli branch: cli ties a bar's
+#' lifetime to a frame, so a bar created with the default .envir would be torn
+#' down the instant this function returned and every later tick would silently
+#' do nothing. That was a real bug here once.
+.pb_new <- function(total, label) {
+  total <- as.integer(total)
+  if (!isTRUE(show_progress_bars) || is.na(total) || total < 1L) return(NULL)
+
+  if (.pb_cli_usable()) {
+    id <- cli::cli_progress_bar(
+      name   = label,
+      total  = total,
+      format = paste0(label,
+                      " {cli::pb_bar} {cli::pb_current}/{cli::pb_total}",
+                      " | {cli::pb_elapsed} | {cli::pb_eta} left"),
+      .envir = parent.frame())
+    return(structure(list(kind = "cli", id = id), class = ".pb"))
+  }
+
+  # An ENVIRONMENT, not a list: a tick inside lapply() has to update the
+  # caller's counter, and a list passed by value would not.
+  st <- new.env(parent = emptyenv())
+  st$i <- 0L; st$total <- total; st$label <- label
+  st$t0 <- proc.time()[["elapsed"]]; st$last_t <- -Inf; st$last_i <- -1L
+  structure(list(kind = "lines", st = st), class = ".pb")
+}
+
+.pb_tick <- function(pb, by = 1L) {
+  if (is.null(pb)) return(invisible(NULL))
+  if (identical(pb$kind, "cli")) {
+    cli::cli_progress_update(id = pb$id, inc = by)
+    return(invisible(NULL))
+  }
+  st <- pb$st
+  st$i <- st$i + by
+  now <- proc.time()[["elapsed"]]
+  step <- max(1L, as.integer(ceiling(st$total * progress_step_frac)))
+  due  <- st$i >= st$total || st$i == 1L ||
+          (st$i - st$last_i) >= step ||
+          (now - st$last_t) >= progress_min_seconds
+  if (!due) return(invisible(NULL))
+  st$last_i <- st$i; st$last_t <- now
+  el   <- now - st$t0
+  frac <- st$i / st$total
+  eta  <- if (st$i > 0L) el / st$i * (st$total - st$i) else NA_real_
+  nfill <- as.integer(round(20 * frac))
+  cat(sprintf("  %s [%s%s] %d/%d %3.0f%% | %s elapsed | ~%s left\n",
+              st$label, strrep("#", nfill), strrep("-", 20L - nfill),
+              st$i, st$total, 100 * frac, .pb_fmt_dur(el), .pb_fmt_dur(eta)))
+  flush.console()
+  invisible(NULL)
+}
+
+.pb_done <- function(pb) {
+  if (is.null(pb)) return(invisible(NULL))
+  if (identical(pb$kind, "cli")) {
+    cli::cli_progress_done(id = pb$id)
+  } else if (pb$st$i < pb$st$total) {
+    # The loop ended early (an epoch with nothing to do, say). Say so rather
+    # than leaving a bar stopped at 12/25 as though something had hung.
+    cat(sprintf("  %s: finished after %d of %d | %s\n", pb$st$label, pb$st$i,
+                pb$st$total, .pb_fmt_dur(proc.time()[["elapsed"]] - pb$st$t0)))
+  }
+  invisible(NULL)
+}
+```
+
+## 0.3 Load the Stage 3 Checkpoint
+
+```{r}
+#| label: params-load_Stage4
+#| code-summary: "Parameters - Load the Stage 3 checkpoint (no point clouds are read in this stage)"
+
+
+# Only the last Stage 3 export is read here. The Stage 4 OUTPUT path
+# (stage4_rds_path) is defined in the Stage 4 save chunk, where it is used.
+stage3_2_rds_path <- "C:/Users/ascsh/Documents/1_Artemis/11_PaqLab/115_TreeTimeAlign/RunR/exports/SaveLoad/I_SNBG_F1_ai_2020_2024_TLS_TLS_Stage3_2.rds"
+
+.par_apply("params-load_Stage4")
+```
+
+```{r}
+#| label: load_Stage4
+#| code-summary: "Load the Stage 3 checkpoint (no point clouds are read in this stage)"
+#| code-fold: false
+
+# Stage 4 uses only a handful of Stage 3 objects. .stage_load pulls EVERYTHING in
+# the RDS via list2env regardless of this list (the manifest only drives the
+# present/absent warnings), so rather than mirror Stage 3.2's ~300-name manifest
+# here - which would drift the moment Stage 3 changes - Stage 4 requests just what
+# it consumes and lets the loader bring the rest in silently. The unrequested
+# (loaded anyway)" note from .stage_load is expected and harmless: those objects
+# are still in the environment for the Stage 4 save chunk to re-checkpoint.
+.stage4_needs <- c(
+  # geometry the shift operates on
+  "pivot1",
+  "ellipses_ax_1_valid", "ellipses_ax_2_valid",
+  # pair universe kept after the Stage 2 XYZ rotation (the set the Z-rot solve
+  # runs on) and the narrower axis-fit set (used for the z-translation pair list)
+  "pairs_stage2",
+  "pairs_ax_fitted",
+  # axes for the tilt diagnostic
+  "vecs_axis_1_rot", "vecs_xy_2",
+  # the recorded (unapplied) Z-translation from Steps 3.17/3.18
+  "t_trans_z"
+)
+.stage4_needs_opt <- c(
+  # present in this Stage 3 build, useful for context, absent on some runs
+  "s5_signal_registry",
+  "s58_pair_tbl", "s58_pair_shift",
+  "s5_pm_true_shift",
+  "apply_mode_3_18", "custom_z_shift_m"
+)
+
+.stage_load(stage3_2_rds_path, .stage4_needs, .stage4_needs_opt, label = "Stage 3.2")
+
+cat("\n\u2500\u2500 Carried in from Stages 1-3 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n")
+if (exists(".report_pivot1")) .report_pivot1()
+
+cat(sprintf("Pairs kept after XYZ rotation (pairs_ax_fitted): %d\n", nrow(pairs_ax_fitted)))
+if (exists("s58_pair_tbl") && !is.null(s58_pair_tbl))
+  cat(sprintf("  of which %d contributed to the Z-translation estimate (Step 3.16)\n",
+              nrow(s58_pair_tbl)))
+cat(sprintf("Z-translation recorded by Stage 3: %+.4f m (not yet applied)\n", t_trans_z))
+cat("No point-cloud data is loaded in this stage.\n")
+```
+
+
+# Stage 4 - Z- Rotation
+
+## 4.1 Confirm or Override the Z-Shift
+
+```{r}
+#| label: params-zshift-toggle
+#| code-summary: "Parameters - Toggle: use the Stage 3 Z-shift, or override it with a custom value"
+
+
+# apply_mode_zshift = "auto" → apply t_trans_z exactly as selected in Stage 3
+# Step 3.15 (default).
+# apply_mode_zshift = "custom" → apply a hand-entered value instead. Useful for
+# testing a value read out of CloudCompare, or
+# for reproducing a manual alignment.
+#
+# Either way the value actually applied is stored as t_trans_z_applied, so the
+# checkpoint always records what was really used rather than what was proposed.
+
+apply_mode_zshift <- "auto"      # "auto" or "custom"
+custom_z_shift_stage4 <- -0.7294 # metres; only used when apply_mode_zshift == "custom"
+
+.par_apply("params-zshift-toggle")
+```
+
+```{r}
+#| label: zshift-toggle
+#| code-summary: "Toggle: use the Stage 3 Z-shift, or override it with a custom value"
+
+if (identical(apply_mode_zshift, "custom")) {
+  t_trans_z_applied <- custom_z_shift_stage4
+  cat(sprintf(
+    "Z-translation OVERRIDDEN with a custom value: %+.4f m\n  (Stage 3 selected %+.4f m)\n",
+    t_trans_z_applied, t_trans_z
+  ))
+} else {
+  t_trans_z_applied <- t_trans_z
+  cat(sprintf("Applying the Stage 3 Z-translation: %+.4f m (%+.2f cm)\n",
+              t_trans_z_applied, t_trans_z_applied * 100))
+}
+```
+
+## 4.2 Shift `pivot1` to `pivot2`
+
+```{r}
+#| label: params-pivot2
+#| code-summary: "Parameters - Translate pivot1 vertically by the applied Z-shift -> pivot2"
+
+
+# pivot1 lives in the post-rotation frame (Stage 3 rotated the cloud about it).
+# Once the whole cloud moves vertically by t_trans_z_applied, the pivot moves
+# with it – otherwise Stage 5 would rotate the shifted ellipse centres about a
+# point that no longer sits at the cloud's footprint centre.
+#
+# Only Z changes: a vertical translation cannot move a horizontal centre. That
+# is why pivot2[1:2] == pivot1[1:2] exactly, and it is the reason Stage 6 can
+# legitimately compose both rotations about pivot1 alone (see the Stage 6
+# equivalence note).
+
+pivot2 <- pivot1 + c(0, 0, t_trans_z_applied)
+
+.par_apply("params-pivot2")
+```
+
+```{r}
+#| label: pivot2
+#| code-summary: "Translate pivot1 vertically by the applied Z-shift -> pivot2"
+
+names(pivot2) <- c("X", "Y", "Z")
+
+cat("── pivot1 -> pivot2 ───────────────────────────────────────────────────────\n")
+cat(sprintf("  pivot1: (%.4f, %.4f, %.4f)\n", pivot1[1], pivot1[2], pivot1[3]))
+cat(sprintf("  shift : (%+.4f, %+.4f, %+.4f)\n", 0, 0, t_trans_z_applied))
+cat(sprintf("  pivot2: (%.4f, %.4f, %.4f)\n", pivot2[1], pivot2[2], pivot2[3]))
+```
+
+## 4.3 Shift the Ellipse Centres
+
+```{r}
+#| label: params-apply-zshift-ellipses
+#| code-summary: "Parameters - Apply the Z-shift to the las_1 ellipse centres -> ellipses_zshift_1 / _2"
+
+
+# ── Absolute vs. stem-relative height fields ─────────────────────────────────
+# Only genuine elevations move. See the stage overview for the full reasoning;
+# in short, stem_len / slice_z are measured from each stem's OWN origin, and
+# that origin translates by the same amount as the stem, so they are invariant
+# under a rigid vertical shift. Shifting them too would apply the offset twice.
+.abs_z_fields <- c("center_z", "global_stem_origin_z",
+                   "stem_len_origin", "stem_len_abs")
+
+.par_apply("params-apply-zshift-ellipses")
+```
+
+```{r}
+#| label: apply-zshift-ellipses
+#| code-summary: "Apply the Z-shift to the las_1 ellipse centres -> ellipses_zshift_1 / _2"
+
+#' Shift every absolute-height field of one tree's ellipse table by dz, then
+#' (re)build slice_z_global from the post-shift stem_len_abs.
+.shift_tree_ellipses <- function(df, tid, dz) {
+  if (is.null(df) || nrow(df) == 0L) return(NULL)
+  df$TreeID <- as.integer(tid)
+  for (f in .abs_z_fields) {
+    if (f %in% names(df)) df[[f]] <- df[[f]] + dz
+  }
+  # Shared-frame elevation of each ellipse. Built from stem_len_abs so that the
+  # two epochs are directly comparable: las_1 has been shifted by dz, las_2 has
+  # dz = 0, and both end up on the same absolute scale.
+  if ("stem_len_abs" %in% names(df)) {
+    df$slice_z_global <- df$stem_len_abs
+  } else {
+    df$slice_z_global <- NA_real_
+  }
+  df
+}
+
+# ── las_1: shifted by t_trans_z_applied ──────────────────────────────────────
+ellipses_zshift_1 <- setNames(
+  lapply(names(ellipses_ax_1_valid), function(tid)
+    .shift_tree_ellipses(ellipses_ax_1_valid[[tid]], tid, t_trans_z_applied)),
+  names(ellipses_ax_1_valid)
+)
+ellipses_zshift_1 <- Filter(Negate(is.null), ellipses_zshift_1)
+
+# ── las_2: the fixed reference cloud – dz = 0, fields pass through unchanged ──
+ellipses_zshift_2 <- setNames(
+  lapply(names(ellipses_ax_2_valid), function(tid)
+    .shift_tree_ellipses(ellipses_ax_2_valid[[tid]], tid, 0)),
+  names(ellipses_ax_2_valid)
+)
+ellipses_zshift_2 <- Filter(Negate(is.null), ellipses_zshift_2)
+
+# ── Flattened las_1 table, kept for inspection and downstream convenience ────
+ellipses_zt_1_shifted <- dplyr::bind_rows(ellipses_zshift_1)
+
+cat(sprintf(
+  "Z-shift applied: %+.4f m (%+.2f cm)\n",
+  t_trans_z_applied, t_trans_z_applied * 100
+))
+cat(sprintf(
+  "  ellipses_zshift_1: %d tree(s), %d ellipse row(s) shifted\n",
+  length(ellipses_zshift_1), nrow(ellipses_zt_1_shifted)
+))
+cat(sprintf(
+  "  ellipses_zshift_2: %d tree(s), %d ellipse row(s) (reference epoch, unshifted)\n",
+  length(ellipses_zshift_2),
+  sum(vapply(ellipses_zshift_2, nrow, integer(1)))
+))
+
+# ── Verification: the two epochs should now overlap in absolute height ───────
+.rng <- function(lst) {
+  v <- unlist(lapply(lst, function(d) d$slice_z_global), use.names = FALSE)
+  v <- v[is.finite(v)]
+  if (length(v) == 0L) return(c(NA_real_, NA_real_))
+  range(v)
+}
+.r1 <- .rng(ellipses_zshift_1)
+.r2 <- .rng(ellipses_zshift_2)
+cat("\n── slice_z_global ranges after the shift ─────────────────────────────────\n")
+cat(sprintf("  las_1 (shifted):   [%.3f, %.3f] m\n", .r1[1], .r1[2]))
+cat(sprintf("  las_2 (reference): [%.3f, %.3f] m\n", .r2[1], .r2[2]))
+cat(sprintf("  Overlap:           [%.3f, %.3f] m (%.3f m deep)\n",
+            max(.r1[1], .r2[1]), min(.r1[2], .r2[2]),
+            max(0, min(.r1[2], .r2[2]) - max(.r1[1], .r2[1]))))
+```
+
+## 4.4 Stem Tilt Annotation (diagnostic)
+
+```{r}
+#| label: stage4-tilt-annotation
+#| code-summary: "Report per-epoch stem tilt from the axis vectors (diagnostic only)"
+
+# Deviation from vertical, in degrees, for each stem axis. Purely descriptive:
+# nothing downstream filters on it. las_1 uses the ROTATED axes produced in
+# Stage 3.2, so this reports tilt as it stands after the XYZ rotation.
+tilt_fn <- function(vx, vy, vz) {
+  len <- sqrt(vx^2 + vy^2 + vz^2)
+  if (is.na(len) || len < 1e-8 || is.na(vz)) return(NA_real_)
+  acos(pmax(-1, pmin(1, abs(vz) / len))) * 180 / pi
+}
+
+stem_tilt_1 <- data.frame(
+  TreeID   = vecs_axis_1_rot$TreeID,
+  tilt_deg = mapply(tilt_fn, vecs_axis_1_rot$vx_rot,
+                    vecs_axis_1_rot$vy_rot, vecs_axis_1_rot$vz_rot)
+)
+stem_tilt_2 <- data.frame(
+  TreeID   = vecs_xy_2$TreeID,
+  tilt_deg = mapply(tilt_fn, vecs_xy_2$vx, vecs_xy_2$vy, vecs_xy_2$vz)
+)
+
+tilt_report <- function(tilt_vec, label) {
+  t_clean <- tilt_vec[is.finite(tilt_vec)]
+  if (length(t_clean) == 0) {
+    cat(sprintf("%s tilt report: no valid tilt values\n", label)); return(invisible(NULL))
+  }
+  cat(sprintf(
+    "%s tilt report (deg): min=%.2f | median=%.2f | mean=%.2f | max=%.2f | n=%d\n",
+    label, min(t_clean), median(t_clean), mean(t_clean), max(t_clean),
+    length(t_clean)
+  ))
+}
+tilt_report(stem_tilt_1$tilt_deg, "las_1 (post-rotation axes)")
+tilt_report(stem_tilt_2$tilt_deg, "las_2 (reference axes)")
+```
+
+## 4.5 Z-overlap filter
+
+```{r}
+#| label: params-pairs-stage4
+#| code-summary: "Parameters - Per-pair z-rotation window from ellipse-CENTRE overlap: zero-point = higher of the two lowest centres, then keep centres in [zero+zrot_bot, zero+zrot_top]"
+
+
+# ── What this does ────────────────────────────────────────────────────────────
+# Builds the pair list AND the per-pair ellipse subset the Z-rotation solve runs
+# on, working purely on ellipse-CENTRE heights - a kept ellipse was fit in the
+# stem-perpendicular frame, so its centre height IS its location; there is no
+# slice extent to compute.
+#
+# Pair universe: every pair kept after the XYZ rotation (pairs_stage2), narrowed
+# to those that actually have Stage-3 ellipses on both sides. Using pairs_stage2
+# (not the z-translation subset) keeps the solve on as many XYZrot survivors as
+# have geometry.
+#
+# Per pair, on the shifted centre heights (slice_z_global):
+# 1. OVERLAP ZERO-POINT. z0 = max(min(z1), min(z2)) - the higher of the two
+# stems' LOWEST centres. Whichever stem has the higher lowest ellipse sets
+# the floor and sits exactly on it; the other stem's nearest ellipse above
+# the floor is, by construction, within one slice step (staggering). The
+# overlap top is z_top = min(max(z1), max(z2)).
+# 2. WINDOW. Take the subsection [z0 + zrot_bot, z0 + zrot_top] measured from
+# the zero-point. With zrot_bot = 0 the zero-point ellipse itself is
+# included. Keep, per stem, the centres whose slice_z_global falls in that
+# band (with a half-slice-step tolerance so a centre sitting essentially on
+# an edge is not lost to rounding).
+# A pair survives when BOTH stems keep >= 1 ellipse in the window and the overlap
+# is real (z_top >= z0). The kept ellipse subsets are what the 4.3 centre-average
+# consumes.
+
+# ── Window parameters ─────────────────────────────────────────────────────────
+zrot_bot   <- 0.00   # window bottom, metres above the overlap zero-point
+zrot_top   <- 1.00   # window top,    metres above the overlap zero-point
+
+.par_apply("params-pairs-stage4")
+```
+
+```{r}
+#| label: pairs-stage4
+#| code-summary: "Per-pair z-rotation window from ellipse-CENTRE overlap: zero-point = higher of the two lowest centres, then keep centres in [zero+zrot_bot, zero+zrot_top]"
+
+s5_slice_step_m <- if (exists("s5_slice_step")) s5_slice_step else 0.10  # fit slice spacing
+.half_step <- s5_slice_step_m / 2                                        # edge tolerance
+
+# ── Pair universe: XYZrot survivors with Stage-3 ellipses on both sides ───────
+pairs_zrot_ok <- if (exists("pairs_stage2")) pairs_stage2 else pairs_ax_fitted
+.base_pairs <- pairs_zrot_ok |>
+  dplyr::filter(as.character(TreeID_1) %in% names(ellipses_zshift_1),
+                as.character(TreeID_2) %in% names(ellipses_zshift_2))
+n_base <- nrow(.base_pairs)
+.tally(n_pairs_stage4_in = n_base)
+
+# centre heights (shifted) for one stem, sorted ascending; NA-safe
+.centre_z <- function(df) {
+  if (is.null(df) || nrow(df) == 0L) return(numeric(0))
+  v <- df$slice_z_global
+  sort(v[is.finite(v)])
+}
+
+# ── Per-pair overlap window + kept-ellipse subset ─────────────────────────────
+kept_1 <- list(); kept_2 <- list(); rows <- list()
+
+for (i in seq_len(n_base)) {
+  t1 <- as.character(.base_pairs$TreeID_1[i])
+  t2 <- as.character(.base_pairs$TreeID_2[i])
+  d1 <- ellipses_zshift_1[[t1]]
+  d2 <- ellipses_zshift_2[[t2]]
+  z1 <- .centre_z(d1); z2 <- .centre_z(d2)
+
+  if (!length(z1) || !length(z2)) {
+    rows[[i]] <- data.frame(TreeID_1 = .base_pairs$TreeID_1[i],
+                            TreeID_2 = .base_pairs$TreeID_2[i],
+                            z0 = NA_real_, z_top = NA_real_,
+                            win_lo = NA_real_, win_hi = NA_real_,
+                            n1 = 0L, n2 = 0L, kept = FALSE,
+                            reason = "no centres on one side")
+    next
+  }
+
+  # overlap on centre heights: zero-point = higher of the two lowest centres
+  z0    <- max(min(z1), min(z2))
+  z_top <- min(max(z1), max(z2))
+
+  if (!(z_top + .half_step >= z0)) {           # no real overlap
+    rows[[i]] <- data.frame(TreeID_1 = .base_pairs$TreeID_1[i],
+                            TreeID_2 = .base_pairs$TreeID_2[i],
+                            z0 = z0, z_top = z_top,
+                            win_lo = NA_real_, win_hi = NA_real_,
+                            n1 = 0L, n2 = 0L, kept = FALSE,
+                            reason = "no centre overlap")
+    next
+  }
+
+  # window measured from the zero-point; clamp the top to the actual overlap top
+  win_lo <- z0 + zrot_bot
+  win_hi <- min(z0 + zrot_top, z_top)
+
+  # keep centres in [win_lo, win_hi], with a half-step edge tolerance so the
+  # zero-point ellipse (and any centre sitting on an edge) is retained
+  in_win <- function(df, z) {
+    if (is.null(df) || nrow(df) == 0L) return(df[0, , drop = FALSE])
+    v <- df$slice_z_global
+    df[is.finite(v) & v >= (win_lo - .half_step) & v <= (win_hi + .half_step), ,
+       drop = FALSE]
+  }
+  k1 <- in_win(d1); k2 <- in_win(d2)
+
+  keep <- nrow(k1) > 0L && nrow(k2) > 0L
+  if (keep) { kept_1[[t1]] <- k1; kept_2[[t2]] <- k2 }
+
+  rows[[i]] <- data.frame(TreeID_1 = .base_pairs$TreeID_1[i],
+                          TreeID_2 = .base_pairs$TreeID_2[i],
+                          z0 = z0, z_top = z_top,
+                          win_lo = win_lo, win_hi = win_hi,
+                          n1 = nrow(k1), n2 = nrow(k2), kept = keep,
+                          reason = if (keep) NA_character_ else "empty window on one side")
+}
+
+stage4_overlap_tbl <- dplyr::bind_rows(rows)
+pairs_stage4 <- .base_pairs[stage4_overlap_tbl$kept %in% TRUE, , drop = FALSE]
+.tally(n_pairs_zoverlap_kept = nrow(pairs_stage4))
+
+# the window-restricted ellipse subsets the Z-rot solve (4.3) consumes
+ellipses_zrot_1 <- kept_1
+ellipses_zrot_2 <- kept_2
+
+# ── Report ────────────────────────────────────────────────────────────────────
+n_keep <- nrow(pairs_stage4)
+cat("Stage 4 z-rotation pair window:\n")
+cat(sprintf("  XYZrot pairs with Stage-3 ellipses (pairs_zrot_ok): %d\n", n_base))
+cat(sprintf("  window: [z0 + %.2f, z0 + %.2f] m above each pair's overlap zero-point\n",
+            zrot_bot, zrot_top))
+cat(sprintf("  slice step %.3f m (edge tolerance +/- %.3f m)\n",
+            s5_slice_step_m, .half_step))
+cat(sprintf("  pairs kept (both sides non-empty in window): %d\n", n_keep))
+
+n_drop <- n_base - n_keep
+if (n_drop > 0L) {
+  dd <- stage4_overlap_tbl[!(stage4_overlap_tbl$kept %in% TRUE),
+                           c("TreeID_1", "TreeID_2", "z0", "z_top", "n1", "n2", "reason"),
+                           drop = FALSE]
+  dd$z0 <- round(dd$z0, 3); dd$z_top <- round(dd$z_top, 3)
+  cat(sprintf("  dropped %d pair(s):\n", n_drop))
+  print(dd, row.names = FALSE)
+}
+```
+
+### Vis - ellipse centre elevations before and after the shift
+
+```{r}
+#| label: fig-zshift-elevations
+#| fig-cap: "Absolute ellipse-centre elevation per PAIR, las_1 and las_2 side by side, before and after the Stage 4 Z-shift. Golden band = that pair's z-rotation window."
+#| fig-height: 7
+
+if (params$make_plots) {
+  # map each stem to the pair it belongs to, so the two epochs share one x slot.
+  # las_1 is keyed by TreeID_1, las_2 by TreeID_2; both resolve to the same pair.
+  .pair_key   <- paste0(pairs_stage4$TreeID_1, "\u2192", pairs_stage4$TreeID_2)
+  .k1 <- setNames(.pair_key, as.character(pairs_stage4$TreeID_1))  # TreeID_1 -> pair
+  .k2 <- setNames(.pair_key, as.character(pairs_stage4$TreeID_2))  # TreeID_2 -> pair
+
+  .gather <- function(lst, cloud_lab, dz_back, keymap) {
+    dplyr::bind_rows(lapply(names(lst), function(tid) {
+      d <- lst[[tid]]
+      if (is.null(d) || nrow(d) == 0L) return(NULL)
+      pk <- keymap[[tid]]
+      if (is.null(pk)) return(NULL)          # stem not in the Stage 4 pair list
+      tibble::tibble(
+        pair   = pk,
+        TreeID = as.integer(tid),
+        cloud  = cloud_lab,
+        after  = d$slice_z_global,
+        before = d$slice_z_global - dz_back
+      )
+    }))
+  }
+
+  z_before_after <- dplyr::bind_rows(
+    .gather(ellipses_zshift_1, "las_1", t_trans_z_applied, .k1),
+    .gather(ellipses_zshift_2, "las_2", 0,                 .k2)
+  ) |>
+    tidyr::pivot_longer(c(before, after), names_to = "state", values_to = "z") |>
+    dplyr::mutate(state = factor(state, levels = c("before", "after")))
+
+  # order pairs on the x-axis by their post-shift median elevation so the panel
+  # reads left-to-right; keeps the two epochs of a pair locked to one slot.
+  .ord <- z_before_after |>
+    dplyr::filter(state == "after") |>
+    dplyr::group_by(pair) |>
+    dplyr::summarise(mz = median(z, na.rm = TRUE), .groups = "drop") |>
+    dplyr::arrange(mz)
+  z_before_after$pair <- factor(z_before_after$pair, levels = .ord$pair)
+
+  # ── Per-pair z-rotation window band (golden) ────────────────────────────────
+  # The window is per-pair (each pair has its own overlap zero-point z0), so the
+  # band sits at a DIFFERENT elevation in every x-slot and is drawn only in the
+  # "after" facet, where the window is defined. win_lo / win_hi come straight
+  # from the pair-list chunk's stage4_overlap_tbl.
+  .band <- stage4_overlap_tbl |>
+    dplyr::filter(.data$kept %in% TRUE,
+                  is.finite(.data$win_lo), is.finite(.data$win_hi)) |>
+    dplyr::mutate(pair = paste0(TreeID_1, "\u2192", TreeID_2)) |>
+    dplyr::filter(pair %in% levels(z_before_after$pair)) |>
+    dplyr::mutate(
+      pair  = factor(pair, levels = levels(z_before_after$pair)),
+      xi    = as.integer(pair),          # discrete x position of this pair's slot
+      state = factor("after", levels = c("before", "after"))
+    )
+
+  gg <- ggplot(z_before_after,
+               aes(x = pair, y = z, colour = cloud,
+                   group = interaction(pair, cloud)))
+
+  # golden band behind the points, one rect per pair spanning its own window
+  if (nrow(.band) > 0L) {
+    gg <- gg +
+      geom_rect(data = .band, inherit.aes = FALSE,
+                aes(xmin = xi - 0.45, xmax = xi + 0.45,
+                    ymin = win_lo,   ymax = win_hi),
+                fill = "#d4a017", alpha = 0.25)
+  }
+
+  gg +
+    # dodge the two epochs within each pair's slot so they sit adjacent, not stacked
+    geom_point(size = 0.7, alpha = 0.5,
+               position = position_dodge(width = 0.6)) +
+    facet_wrap(~ state, ncol = 1, scales = "fixed") +
+    scale_colour_manual(values = c("las_1" = COL_1, "las_2" = COL_2), name = NULL) +
+    labs(
+      title    = sprintf("Ellipse-centre elevations by pair, Z-shift = %+.4f m", t_trans_z_applied),
+      subtitle = sprintf("Each x slot is one pair; las_1/las_2 dodged. Golden band = z-rot window [z0+%.2f, z0+%.2f] m (after only).",
+                         zrot_bot, zrot_top),
+      x = "pair (TreeID_1 \u2192 TreeID_2, ordered by post-shift elevation)",
+      y = "slice_z_global (m)"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 6))
+}
+```
+
+
+### Vis - point clouds after Z-translation
+
+Stage 4 works on ellipse geometry alone, so this figure loads and transforms
+its own copy of the clouds. The loader rebuilds the Stage 2 rotation and the
+Z-shift applied above, so what is drawn is the cloud as it stands at the end of
+this stage.
+
+### Vis - point clouds after Z-translation
+```{r}
+#| label: params-fig-zt-3D
+#| code-summary: "Parameters - fig-zt-3D"
+
+
+# ── Point clouds for this figure ──────────────────────────────────────────────
+# This stage does not load point clouds at the top, so this figure loads its own.
+# vis_load_clouds <- TRUE read las_1 / las_2 from disk and apply the
+# Stage 1A alignment + the Stage 2 rotation reapplied
+# vis_load_clouds <- FALSE reuse the clouds already in memory (no disk read)
+# The loader also rebuilds the transform state this figure expects, so the
+# points shown match the pipeline stage rather than the file on disk.
+vis_load_clouds <- TRUE
+
+.par_apply("params-fig-zt-3D")
+```
+
+```{r}
+#| label: fig-zt-3D
+#| fig-cap: "Paired tree point clouds after full XYZ rotation + Z-translation (0-5 m stem)."
+
+.vpc <- .vis_point_clouds(
+  load = vis_load_clouds,
+  apply_rot     = TRUE,
+  apply_zshift  = TRUE
+)
+
+las1_pts_zt <- .vpc$pts_1   # las_1: rotation + Z-shift rebuilt
+las2_pts_zt <- .vpc$pts_2   # las_2: reference epoch, untransformed
+
+
+if (params$make_plots) {
+
+  max_pts_zt   <- 1000L   # <- custom point count per stem, adjust as needed
+  zt_slice_top <- 5       # metres above each stem's local Z minimum
+
+  stem_pts_zt <- bind_rows(lapply(seq_len(nrow(pairs_stage4)), function(i) {
+    tid1 <- pairs_stage4$TreeID_1[i]
+    tid2 <- pairs_stage4$TreeID_2[i]
+
+    pts1_all <- las1_pts_zt[las1_pts_zt$TreeID == tid1, ]
+    if (nrow(pts1_all) == 0) return(NULL)
+    z0_1 <- min(pts1_all$Z)
+    pts1 <- pts1_all[pts1_all$Z - z0_1 <= zt_slice_top, ]
+    if (nrow(pts1) > max_pts_zt) pts1 <- pts1[sample.int(nrow(pts1), max_pts_zt), ]
+    pts1 <- pts1 |> mutate(cloud = "las_1 (xyz-rot + z-shift)", TreeID_pair = tid1)
+
+    pts2_all <- las2_pts_zt[las2_pts_zt$TreeID == tid2, ]
+    if (nrow(pts2_all) == 0) return(NULL)
+    z0_2 <- min(pts2_all$Z)
+    pts2 <- pts2_all[pts2_all$Z - z0_2 <= zt_slice_top, ]
+    if (nrow(pts2) > max_pts_zt) pts2 <- pts2[sample.int(nrow(pts2), max_pts_zt), ]
+    pts2 <- pts2 |> mutate(cloud = "las_2", TreeID_pair = tid1)
+
+    bind_rows(pts1, pts2)
+  }))
+
+  global_cx_zt <- mean(stem_pts_zt$X[stem_pts_zt$cloud == "las_2"], na.rm = TRUE)
+  global_cy_zt <- mean(stem_pts_zt$Y[stem_pts_zt$cloud == "las_2"], na.rm = TRUE)
+
+  stem_pts_zt <- stem_pts_zt |>
+    mutate(X_local = X - global_cx_zt, Y_local = Y - global_cy_zt)
+
+  plot_ly(
+    data = stem_pts_zt, x = ~X_local, y = ~Y_local, z = ~Z,
+    color = ~cloud,
+    colors = c("las_1 (xyz-rot + z-shift)" = COL_1, "las_2" = COL_2),
+    type = "scatter3d", mode = "markers",
+    marker = list(size = 2, opacity = 0.6),
+    text = ~paste0("Cloud: ", cloud, "<br>Pair: ", TreeID_pair, "<br>Z: ", round(Z, 3)),
+    hoverinfo = "text"
+  ) |>
+    layout(
+      title = sprintf(
+        "Full XYZ rotation + Z-translation – %d pairs (0-%d m, %d pts/stem)",
+        nrow(pairs_stage4), zt_slice_top, max_pts_zt
+      ),
+      scene = list(
+        xaxis = list(title = "X local (m)"),
+        yaxis = list(title = "Y local (m)"),
+        zaxis = list(title = "Z (m)"),
+        aspectmode = "data",
+        camera = list(eye = list(x = 1.5, y = 1.5, z = 0.8))
+      ),
+      legend = list(title = list(text = "Cloud"))
+    )
+}
+```
+
+
+
+## 4.6 Average Ellipse Centres per Tree
+
+```{r}
+#| label: params-avg-ellipse-centres-zrot
+#| code-summary: "Parameters - Collapse each tree's WINDOWED ellipse subset to one representative XY centre per epoch"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INPUT: pairs_zrot_ok (= pairs_stage2), ellipses_zrot_1, ellipses_zrot_2
+# OUTPUT: avg_centres_1, avg_centres_2, pairs_zrot_valid
+# ─────────────────────────────────────────────────────────────────────────────
+# The yaw solve works on ONE point per stem per epoch: the mean of that stem's
+# ellipse centres WITHIN the z-rotation window [z0+zrot_bot, z0+zrot_top]. Those
+# windowed subsets are ellipses_zrot_1 / ellipses_zrot_2, built per pair by the
+# 4.2 Z-overlap chunk - NOT the full-stem ellipses_zshift_*. Averaging only the
+# windowed centres is the whole point of the bot/top range: the rotation is
+# estimated from the band where the two epochs actually overlap.
+#
+# The PAIR UNIVERSE is still the full XYZrot-survivor set (pairs_stage2). Because
+# ellipses_zrot_* is keyed only for pairs that survived the window with a
+# non-empty subset on both sides, any pairs_stage2 pair outside that set has no
+# entry here and is dropped by compute_avg_centre as "not found" - so the
+# effective set is exactly "XYZrot pairs that also have a non-empty windowed
+# ellipse subset on both sides".
+pairs_zrot_ok <- pairs_stage2
+
+.par_apply("params-avg-ellipse-centres-zrot")
+```
+
+```{r}
+#| label: avg-ellipse-centres-zrot
+#| code-summary: "Collapse each tree's WINDOWED ellipse subset to one representative XY centre per epoch"
+
+.zrot_pairs <- pairs_zrot_ok |>
+
+  dplyr::mutate(TreeID_1 = as.integer(TreeID_1),
+                TreeID_2 = as.integer(TreeID_2))
+
+# per-tree mean centre (and mean shape), ID-safe against the named ellipse list
+compute_avg_centre <- function(ellipse_list, tree_ids) {
+  results <- lapply(as.integer(tree_ids), function(tid_int) {
+    tid_chr <- as.character(tid_int)
+    df      <- ellipse_list[[tid_chr]]
+    if (is.null(df))   return(list(row = NULL, invalid_reason = "not found in windowed ellipse list"))
+    if (nrow(df) == 0) return(list(row = NULL, invalid_reason = "windowed subset is empty"))
+    df <- df[!is.na(df$center_x) & !is.na(df$center_y), ]
+    if (nrow(df) == 0) return(list(row = NULL, invalid_reason = "all windowed centres are NA"))
+    a_mean <- mean(df$semi_a, na.rm = TRUE); b_mean <- mean(df$semi_b, na.rm = TRUE)
+    list(
+      row = data.frame(
+        TreeID    = tid_int,
+        cx        = mean(df$center_x, na.rm = TRUE),
+        cy        = mean(df$center_y, na.rm = TRUE),
+        a_mean    = a_mean, b_mean = b_mean,
+        ang_mean  = mean(df$angle_deg, na.rm = TRUE),
+        area_mean = if ("ell_area" %in% names(df)) mean(df$ell_area, na.rm = TRUE) else NA_real_,
+        r_mean    = sqrt(a_mean * b_mean),
+        n_win     = nrow(df)            # how many windowed ellipses backed this centre
+      ),
+      invalid_reason = NA_character_)
+  })
+  valid_rows   <- dplyr::bind_rows(lapply(results, `[[`, "row"))
+  invalid_flag <- vapply(results, function(x) !is.na(x$invalid_reason), logical(1))
+  invalid_df   <- data.frame(
+    TreeID = as.integer(tree_ids)[invalid_flag],
+    reason = vapply(results[invalid_flag], `[[`, character(1), "invalid_reason"))
+  list(centres = valid_rows, invalid = invalid_df)
+}
+
+res_1 <- compute_avg_centre(ellipses_zrot_1, .zrot_pairs$TreeID_1)
+res_2 <- compute_avg_centre(ellipses_zrot_2, .zrot_pairs$TreeID_2)
+avg_centres_1 <- res_1$centres
+avg_centres_2 <- res_2$centres
+
+cat(sprintf("Average centres computed from the z-rot window [z0+%.2f, z0+%.2f] m - las_1: %d tree(s) | las_2: %d tree(s)\n",
+            zrot_bot, zrot_top, nrow(avg_centres_1), nrow(avg_centres_2)))
+
+if (nrow(res_1$invalid) > 0) {
+  cat(sprintf("\nlas_1 trees with no usable windowed centre (%d):\n", nrow(res_1$invalid)))
+  print(res_1$invalid, row.names = FALSE)
+}
+if (nrow(res_2$invalid) > 0) {
+  cat(sprintf("\nlas_2 trees with no usable windowed centre (%d):\n", nrow(res_2$invalid)))
+  print(res_2$invalid, row.names = FALSE)
+}
+
+# keep only pairs with a valid windowed centre on BOTH sides
+pairs_zrot_valid <- .zrot_pairs |>
+  dplyr::filter(TreeID_1 %in% avg_centres_1$TreeID,
+                TreeID_2 %in% avg_centres_2$TreeID)
+
+n_drop <- nrow(.zrot_pairs) - nrow(pairs_zrot_valid)
+if (n_drop > 0) cat(sprintf("\n%d pair(s) dropped for a missing/empty windowed centre.\n", n_drop))
+cat(sprintf("Pairs with valid windowed avg centres in both epochs: %d / %d\n",
+            nrow(pairs_zrot_valid), nrow(.zrot_pairs)))
+```
+
+## 4.7 Create Line Network
+
+```{r}
+#| label: build-line-network-zrot
+#| code-summary: "Build the inter-tree line network on windowed averaged centres and measure per-edge angular difference between epochs"
+
+# Every unordered pair of kept stems is an EDGE. For each edge, take the las_1
+# direction (from the two las_1 windowed-average centres) and the las_2 direction
+# (from the corresponding las_2 centres) and measure the angle between them.
+# Under a pure yaw, every edge rotates by the same angle, so ang_diff is a
+# per-edge estimate of the rotation; averaging the clean ones (4.5-4.7) solves it.
+centers_zr_1 <- avg_centres_1 |> dplyr::filter(TreeID %in% pairs_zrot_valid$TreeID_1)
+centers_zr_2 <- avg_centres_2 |> dplyr::filter(TreeID %in% pairs_zrot_valid$TreeID_2)
+pair_map_zr  <- pairs_zrot_valid |> dplyr::select(TreeID_1, TreeID_2)
+
+tree_ids_zr <- centers_zr_1$TreeID
+edge_idx_zr <- which(upper.tri(matrix(NA, length(tree_ids_zr), length(tree_ids_zr))),
+                     arr.ind = TRUE)
+
+edges_zr1 <- data.frame(
+  TreeID_1_a = tree_ids_zr[edge_idx_zr[, 1]],
+  TreeID_1_b = tree_ids_zr[edge_idx_zr[, 2]]
+) |>
+  dplyr::left_join(centers_zr_1 |> dplyr::rename(cx1_a = cx, cy1_a = cy),
+                   by = c("TreeID_1_a" = "TreeID")) |>
+  dplyr::left_join(centers_zr_1 |> dplyr::rename(cx1_b = cx, cy1_b = cy),
+                   by = c("TreeID_1_b" = "TreeID"))
+
+edges_zr2 <- edges_zr1 |>
+  dplyr::left_join(pair_map_zr |> dplyr::rename(TreeID_1_a = TreeID_1, TreeID_2_a = TreeID_2),
+                   by = "TreeID_1_a") |>
+  dplyr::left_join(pair_map_zr |> dplyr::rename(TreeID_1_b = TreeID_1, TreeID_2_b = TreeID_2),
+                   by = "TreeID_1_b") |>
+  dplyr::left_join(centers_zr_2 |> dplyr::rename(cx2_a = cx, cy2_a = cy),
+                   by = c("TreeID_2_a" = "TreeID")) |>
+  dplyr::left_join(centers_zr_2 |> dplyr::rename(cx2_b = cx, cy2_b = cy),
+                   by = c("TreeID_2_b" = "TreeID"))
+
+line_df_zr <- edges_zr2 |>
+  dplyr::filter(!is.na(cx1_a), !is.na(cx1_b), !is.na(cx2_a), !is.na(cx2_b)) |>
+  dplyr::mutate(
+    dx1 = cx1_b - cx1_a, dy1 = cy1_b - cy1_a, angle_1 = angle_from_x_ccw(dx1, dy1),
+    dx2 = cx2_b - cx2_a, dy2 = cy2_b - cy2_a, angle_2 = angle_from_x_ccw(dx2, dy2),
+    ang_diff = angle_2 - angle_1,
+    mx = (cx1_a + cx1_b) / 2, my = (cy1_a + cy1_b) / 2
+  )
+
+# fold angular differences into (-180, 180] so a wrap at +/-180 does not distort
+# the median/mean of the solve
+line_df_zr$ang_diff <- ((line_df_zr$ang_diff + 180) %% 360) - 180
+
+cat(sprintf("Line network: %d edge(s) across %d stem(s)\n",
+            nrow(line_df_zr), length(tree_ids_zr)))
+cat(sprintf("Edge-wise angular difference (deg): median %.3f | mean %.3f | sd %.3f\n",
+            median(line_df_zr$ang_diff), mean(line_df_zr$ang_diff), sd(line_df_zr$ang_diff)))
+```
+
+### Vis - ellipse-centre line angles
+
+```{r}
+#| label: fig-ellipse-lines-angles
+#| fig-cap: "las_1 centre network (best 6 stems by kept ellipse count); each edge coloured by angular difference to the corresponding las_2 edge."
+#| fig-height: 7
+#| fig-width: 7
+
+if (params$make_plots && nrow(line_df_zr) > 0) {
+  # rank stems by how many WINDOWED ellipses backed their centre (reliability
+  # proxy), reading the windowed subsets - not the full stem
+  ell_count_zr <- vapply(as.character(pairs_zrot_valid$TreeID_1), function(tid_chr) {
+    df <- ellipses_zrot_1[[tid_chr]]; if (is.null(df)) 0L else nrow(df)
+  }, integer(1))
+  names(ell_count_zr) <- as.character(pairs_zrot_valid$TreeID_1)
+  top6_ids <- names(sort(ell_count_zr, decreasing = TRUE))[seq_len(min(6L, length(ell_count_zr)))]
+
+  line_df_zr_top6 <- line_df_zr |>
+    dplyr::filter(as.character(TreeID_1_a) %in% top6_ids &
+                  as.character(TreeID_1_b) %in% top6_ids)
+  ellipses_top6_pts <- dplyr::bind_rows(lapply(top6_ids, function(tid_chr) {
+    df <- ellipses_zrot_1[[tid_chr]]
+    if (is.null(df)) return(NULL)
+    d <- df[!is.na(df$center_x), c("center_x", "center_y")]
+    dplyr::rename(d, X = center_x, Y = center_y)
+  }))
+  centers_zr_1_top6 <- centers_zr_1 |> dplyr::filter(as.character(TreeID) %in% top6_ids)
+
+  print(
+    ggplot() +
+      geom_point(data = ellipses_top6_pts, aes(X, Y),
+                 colour = COL_1, size = 0.4, alpha = 0.5) +
+      geom_segment(data = line_df_zr_top6,
+                   aes(x = cx1_a, y = cy1_a, xend = cx1_b, yend = cy1_b, colour = ang_diff),
+                   linewidth = 0.7, alpha = 0.9) +
+      geom_point(data = centers_zr_1_top6, aes(cx, cy), colour = "black", size = 2) +
+      geom_text(data = line_df_zr_top6, aes(mx, my, label = sprintf("%.2f\u00b0", ang_diff)),
+                size = 3, vjust = -0.4, colour = "black") +
+      scale_colour_gradient2(low = "firebrick", mid = "grey60", high = COL_2,
+                             midpoint = 0, name = "delta angle\n(deg)") +
+      coord_equal() +
+      labs(title = "las_1 centre network (best 6 stems) - edge-wise angular differences to las_2",
+           x = "X (m)", y = "Y (m)") +
+      theme_bw(base_size = 11)
+  )
+}
+```
+
+## 4.8 Angular diff outlier filter
+
+```{r}
+#| label: params-ellipse-outlier-removal
+#| code-summary: "Parameters - Iteratively remove the stem whose edges disagree most with the consensus (MAD on ang_diff)"
+
+
+# A stem with a bad windowed centre corrupts EVERY edge it participates in, so
+# outliers are removed one STEM at a time. Each round: flag edges whose ang_diff
+# is > mad_thresh_zr MADs from the median, count how many flagged edges each stem
+# touches, drop the worst-offending stem, and repeat until no edge is flagged.
+#
+# TIE-BREAK. When several stems touch the same number of flagged edges, the one
+# whose own edges sit furthest from the consensus goes. That used to be decided
+# by which removal most reduced sd(ang_diff), which is undefined once a
+# candidate removal leaves fewer than two edges - on a small network every
+# candidate scored NA, which.max() returned integer(0), and indexing the edge
+# frame with a zero-length vector silently emptied it. A four-stem network then
+# reported "1 stem removed, 0 kept". Mean absolute deviation from the median is
+# defined for a single edge, so the tie-break can no longer collapse.
+mad_thresh_zr    <- 4
+
+# FLOOR. Below this many stems the network cannot support an outlier test at
+# all: with 3 stems there are 3 edges and one bad stem touches two of them, so
+# "the consensus" is a single edge. The loop stops rather than eating the set.
+zr_min_stems     <- 3L
+
+edges_zr         <- line_df_zr
+removed_trees_zr <- character()
+n_trees_start    <- length(unique(c(line_df_zr$TreeID_1_a, line_df_zr$TreeID_1_b)))
+zr_stop_reason   <- "no outlying edge"
+
+.par_apply("params-ellipse-outlier-removal")
+```
+
+```{r}
+#| label: ellipse-outlier-removal
+#| code-summary: "Iteratively remove the stem whose edges disagree most with the consensus (MAD on ang_diff)"
+
+# Stems currently represented in the edge set.
+.zr_stems <- function(e) unique(c(as.character(e$TreeID_1_a),
+                                  as.character(e$TreeID_1_b)))
+
+repeat {
+  if (nrow(edges_zr) < 2L) { zr_stop_reason <- "fewer than 2 edges left"; break }
+
+  .n_now <- length(.zr_stems(edges_zr))
+  if (.n_now <= zr_min_stems) {
+    zr_stop_reason <- sprintf("floor reached (%d stems, zr_min_stems = %d)",
+                              .n_now, zr_min_stems)
+    break
+  }
+
+  med_zr <- median(edges_zr$ang_diff); mad_val_zr <- mad(edges_zr$ang_diff)
+  if (is.na(mad_val_zr) || mad_val_zr < 1e-10) {
+    zr_stop_reason <- "MAD is zero - every edge agrees"; break
+  }
+  edges_zr$outlier <- abs(edges_zr$ang_diff - med_zr) / mad_val_zr > mad_thresh_zr
+  if (!any(edges_zr$outlier)) { zr_stop_reason <- "no outlying edge"; break }
+
+  tree_counts_zr <- table(c(as.character(edges_zr$TreeID_1_a[edges_zr$outlier]),
+                            as.character(edges_zr$TreeID_1_b[edges_zr$outlier])))
+  worst_zr <- names(tree_counts_zr)[tree_counts_zr == max(tree_counts_zr)]
+
+  if (length(worst_zr) == 1L) {
+    tree_to_remove_zr <- worst_zr
+  } else {
+    # Mean |ang_diff - median| over the edges that stem touches. Always defined
+    # (a stem in the edge set touches at least one edge), so the selection below
+    # always returns exactly one name.
+    dev_zr <- vapply(worst_zr, function(tid) {
+      touch <- as.character(edges_zr$TreeID_1_a) == tid |
+               as.character(edges_zr$TreeID_1_b) == tid
+      if (!any(touch)) return(-Inf)
+      mean(abs(edges_zr$ang_diff[touch] - med_zr))
+    }, numeric(1))
+    tree_to_remove_zr <- worst_zr[order(-dev_zr, worst_zr)][1L]
+  }
+
+  # Belt and braces: a zero-length or NA name here would index the edge frame
+  # with a zero-length vector and wipe it out without removing anything. If it
+  # ever happens the loop stops and says so, rather than reporting an empty
+  # network as a result.
+  if (length(tree_to_remove_zr) != 1L || is.na(tree_to_remove_zr)) {
+    zr_stop_reason <- "could not identify a single worst stem"; break
+  }
+
+  # Would this removal take the network below the floor? Then it is not a
+  # removal worth making - keep the stem and stop.
+  .keep <- !(as.character(edges_zr$TreeID_1_a) == tree_to_remove_zr |
+             as.character(edges_zr$TreeID_1_b) == tree_to_remove_zr)
+  .keep[is.na(.keep)] <- FALSE
+  if (length(.zr_stems(edges_zr[.keep, , drop = FALSE])) < zr_min_stems) {
+    zr_stop_reason <- sprintf("removing stem %s would leave fewer than %d stems",
+                              tree_to_remove_zr, zr_min_stems)
+    break
+  }
+
+  removed_trees_zr <- c(removed_trees_zr, tree_to_remove_zr)
+  edges_zr <- edges_zr[.keep, , drop = FALSE]
+}
+
+clean_edges_zr   <- edges_zr
+removed_edges_zr <- line_df_zr[line_df_zr$TreeID_1_a %in% removed_trees_zr |
+                               line_df_zr$TreeID_1_b %in% removed_trees_zr, ]
+n_trees_kept <- length(unique(c(clean_edges_zr$TreeID_1_a, clean_edges_zr$TreeID_1_b)))
+
+# The inter-stem line filter removes STEMS, not edges, so the surviving pair set
+# is every pair whose las_1 stem still appears in a clean edge. Recorded as a
+# pair count so it lines up with every other number in the tally.
+pairs_stage4_lines <- pairs_stage4[
+  as.character(pairs_stage4$TreeID_1) %in%
+    as.character(unique(c(clean_edges_zr$TreeID_1_a, clean_edges_zr$TreeID_1_b))), ,
+  drop = FALSE]
+.tally(n_stems_lines_start = n_trees_start,
+       n_stems_lines_kept  = n_trees_kept,
+       n_pairs_lines_kept  = nrow(pairs_stage4_lines))
+
+cat(sprintf("Trees entering MAD filter:   %d\n", n_trees_start))
+cat(sprintf("Trees removed by MAD filter: %d\n", length(removed_trees_zr)))
+cat(sprintf("Trees kept after MAD filter: %d\n", n_trees_kept))
+cat(sprintf("  stopped because: %s\n", zr_stop_reason))
+if (length(removed_trees_zr) > 0)
+  cat(sprintf("  Removed TreeIDs: %s\n", paste(removed_trees_zr, collapse = ", ")))
+
+# entering - removed must equal kept. If it does not, stems left the network
+# without being removed by name, which is the failure this chunk used to have.
+if (n_trees_kept != n_trees_start - length(removed_trees_zr))
+  warning(sprintf(paste0("[4.8] stem bookkeeping does not balance: %d entered, %d removed, ",
+                         "%d kept. Edges were lost without a stem being named."),
+                  n_trees_start, length(removed_trees_zr), n_trees_kept))
+if (n_trees_kept == 0L)
+  warning("[4.8] the angular-difference filter left NO stems - Stage 4's z-rotation cannot be solved from an empty edge set.")
+cat(sprintf("Clean edges: %d | Removed edges: %d\n",
+            nrow(clean_edges_zr), nrow(removed_edges_zr)))
+```
+
+### Vis - angular correction distribution
+
+```{r}
+#| label: fig-angular-diff-whisker
+#| fig-cap: "Edge-wise angular differences after outlier removal. Green = kept, red = removed; black line = mean (the solved rotation)."
+
+if (params$make_plots && nrow(clean_edges_zr) > 0) {
+  print(
+    ggplot() +
+      geom_point(data = clean_edges_zr, aes(x = "delta angle", y = ang_diff),
+                 colour = "#00AA00", size = 3, alpha = 1.0) +
+      { if (nrow(removed_edges_zr) > 0)
+          geom_point(data = removed_edges_zr, aes(x = "delta angle", y = ang_diff),
+                     colour = "red", size = 1, alpha = 0.3) } +
+      stat_summary(data = clean_edges_zr, aes(x = "delta angle", y = ang_diff),
+                   fun.min = min, fun.max = max, geom = "errorbar", width = 0.15,
+                   colour = "red", linewidth = 0.9, linetype = "dotted") +
+      geom_hline(yintercept = mean(clean_edges_zr$ang_diff),
+                 colour = "black", linetype = "dotted", linewidth = 1) +
+      labs(title = "Angular differences (kept vs removed edges)",
+           subtitle = "Green = kept, red = removed; black dotted = mean = solved rotation",
+           x = "", y = "Angular difference (deg)") +
+      theme_minimal(base_size = 12)
+  )
+}
+```
+
+## 4.9 Z rot solve
+
+```{r}
+#| label: z-only-rotation-solve
+#| code-summary: "Solve the Z-only rotation as the mean of the cleaned edge-wise angular differences"
+
+# The solve: a pure yaw rotates every edge by the same angle, so the best single
+# estimate is the mean of the surviving (outlier-free) edge-wise differences,
+# all measured from windowed centres. Recorded as z_rotation_deg / z_rotation_rad;
+# Stage 5/6 apply it.
+if (nrow(clean_edges_zr) == 0L)
+  stop("Z-rot solve: no clean edges survived the outlier filter - cannot solve the rotation.")
+
+z_rotation_deg <- mean(clean_edges_zr$ang_diff)
+z_rotation_rad <- z_rotation_deg * pi / 180
+
+rotation_summary_zr <- tibble::tibble(
+  rotation_deg    = z_rotation_deg,
+  rotation_rad    = z_rotation_rad,
+  n_trees_start   = n_trees_start,
+  n_trees_kept    = n_trees_kept,
+  n_trees_removed = length(removed_trees_zr),
+  n_edges_used    = nrow(clean_edges_zr),
+  n_edges_removed = nrow(removed_edges_zr)
+)
+
+cat(sprintf("Z-only rotation solved: %.4f deg (%.6f rad)\n", z_rotation_deg, z_rotation_rad))
+print(as.data.frame(rotation_summary_zr), row.names = FALSE)
+```
+
+### Export LAS - Post ZShift
+
+```{r}
+#| label: params-export-zshift-cloud
+#| code-summary: "Parameters - Write las_1 with the full XYZ rotation + Stage 4 Z-translation baked in, to a .las snapshot"
+
+
+# Stage 4 works on ellipse geometry and never loads point clouds at the top, so
+# - like the 3D figure above - this export loads its own copy on demand and
+# rebuilds the transform state. .vis_point_clouds returns xyz_1, the las_1 points
+# with the rotation AND the Z-shift already applied. The Z-only rotation solved
+# in 4.7 is NOT baked in here (it is applied in Stage 5/6); this snapshot is the
+# post-translation cloud, matching where the ellipse geometry stands.
+#
+# export_zshift_cloud <- TRUE/FALSE master switch
+# vis_load_clouds <- TRUE/FALSE read from disk vs reuse in-memory clouds
+export_zshift_cloud <- TRUE
+vis_load_clouds     <- TRUE
+
+# NOTE: this default points at the OLD "111 Documents Artemis/124 Master Thesis"
+# tree, not the current 1_Artemis/11_PaqLab one. Interactively it will fail on a
+# missing directory until you repoint it.
+output_path_zshift <- "C:/Users/ascsh/Documents/111 Documents Artemis/124 Master Thesis/Alignment/Correction_Matrix/2026-07-14_Axis/GZ/Export_Ztrans_BOS_F1_P1.las"
+
+.par_apply("params-export-zshift-cloud")
+```
+
+```{r}
+#| label: export-zshift-cloud
+#| code-summary: "Write las_1 with the full XYZ rotation + Stage 4 Z-translation baked in, to a .las snapshot"
+
+# Off in a batch unless asked for - same reasoning as Stage 3's rotated-cloud
+# snapshot, and doubly so here: this export RELOADS both clouds from disk to
+# rebuild the transform state, which is real time per pair for a file nobody
+# opens. Stage 6 writes the aligned cloud that actually matters.
+if (.in_batch()) {
+  export_zshift_cloud <- isTRUE(.batch_opt(".batch_export_stage_clouds", FALSE))
+  if (export_zshift_cloud)
+    output_path_zshift <- file.path(.batch_opt(".batch_export_dir", dirname(output_path_zshift)),
+                                    paste0(.batch_opt(".batch_sample", "sample"),
+                                           "_Ztrans.las"))
+}
+
+if (isTRUE(export_zshift_cloud)) {
+  .vpc_exp <- .vis_point_clouds(load = vis_load_clouds,
+                                apply_rot = TRUE, apply_zshift = TRUE, need_las2 = FALSE)
+  .write_las_snapshot(las_template = .vpc_exp$las_1, xyz_mat = .vpc_exp$xyz_1,
+                      output_path = output_path_zshift,
+                      stage_label = "4.8 xyz-rot + z-translation")
+} else {
+  cat("export-zshift-cloud: export_zshift_cloud = FALSE - skipping .las export.\n")
+}
+```
+
+## Save/Load – Stage 4
+
+```{r}
+#| label: params-save-load_Stage4
+#| code-summary: "Parameters - Save or load the complete Stage 4 object set"
+
+
+# The Stage 4 OUTPUT path lives here (the load chunk reads only the Stage 3 path).
+stage4_rds_path <- "C:/Users/ascsh/Documents/1_Artemis/11_PaqLab/115_TreeTimeAlign/SaveLoad/Stage4_BOS_F1_ai_manualcontinue.rds"
+
+stage4_save <- TRUE
+stage4_load <- FALSE
+
+.par_apply("params-save-load_Stage4")
+```
+
+```{r}
+#| label: save-load_Stage4
+#| code-summary: "Save or load the complete Stage 4 object set"
+
+# A batch decides these itself, whatever they are left set to above. Both are
+# read a few lines below, in this same chunk, so the driver's overrides land
+# too late to reach them - and a stage left switched to LOAD after an
+# interactive session would otherwise make a batch write no checkpoint at all
+# and say nothing about it. Saving is what a batch is for; loading is a no-op
+# in one, since every stage runs in the same session.
+if (.in_batch()) { stage4_save <- TRUE; stage4_load <- FALSE }
+
+# Stage 4 checkpoint = everything the Stage 3.2 RDS carried (still in the
+# environment after the load chunk) + Stage 4's own products. Snapshot the
+# current environment's data objects (dropping functions and internal dot-names)
+# and add the Stage 4 names explicitly, so this never drifts from upstream.
+.stage4_new <- c(
+  # 4.1 applied shift + toggle
+  "t_trans_z_applied", "apply_mode_zshift", "custom_z_shift_stage4",
+  # 4.2 shifted pivot
+  "pivot2",
+  # 4.2a shifted ellipses (full stem)
+  "ellipses_zshift_1", "ellipses_zshift_2", "ellipses_zt_1_shifted",
+  # 4.2b tilt diagnostic
+  "stem_tilt_1", "stem_tilt_2",
+  # 4.2 z-rotation window: params, per-pair overlap table, windowed subsets, kept pairs
+  "zrot_bot", "zrot_top", "stage4_overlap_tbl",
+  "ellipses_zrot_1", "ellipses_zrot_2", "pairs_stage4",
+  # 4.3-4.4 solve inputs (centres from the windowed subsets)
+  "pairs_zrot_ok", "avg_centres_1", "avg_centres_2", "pairs_zrot_valid", "line_df_zr",
+  # 4.5 outlier filter products
+  "clean_edges_zr", "removed_edges_zr", "removed_trees_zr", "mad_thresh_zr",
+  "pairs_stage4_lines",
+  # 4.7 the solved rotation - the stage's headline output
+  "z_rotation_deg", "z_rotation_rad", "rotation_summary_zr"
+)
+
+# carry forward whatever came in from Stage 3.2 (data objects only, no helpers)
+.carried <- setdiff(ls(envir = .stage_env()), lsf.str(envir = .stage_env()))
+.carried <- .carried[!startsWith(.carried, ".")]
+
+.stage4_required <- unique(c(.carried, .stage4_new))
+.stage4_optional <- character(0)
+
+if (stage4_save) {
+  .stage_save(stage4_rds_path, .stage4_required, .stage4_optional, label = "Stage 4")
+}
+
+if (stage4_load) {
+  .stage_load(stage4_rds_path, .stage4_required, .stage4_optional, label = "Stage 4")
+  cat(sprintf("\nStage 4 restored: Z-shift %+.4f m | Z-rotation %+.4f deg | %d pair(s)\n",
+              t_trans_z_applied, z_rotation_deg, nrow(pairs_stage4)))
+  if (exists(".report_pivot1")) .report_pivot1()
+  cat(sprintf("pivot2: (%.4f, %.4f, %.4f)\n", pivot2[1], pivot2[2], pivot2[3]))
+}
+```
+
+Next step
+
+Run `Stage5_ZRotationXY.qmd`. It loads this checkpoint, rebuilds each stem's
+vertical profile from the shifted ellipse centres, and solves the Z-only
+rotation and the residual XY translation.

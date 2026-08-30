@@ -1,0 +1,1361 @@
+---
+title: "Test Sample Generator - Known-Truth Misalignment"
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    code-fold: true
+    code-summary: "Show code"
+    embed-resources: true
+params:
+  make_plots: true
+---
+
+# Overview - Test Sample Generator
+
+Every stage of the alignment pipeline reports what it *solved*. None of them can
+report what it got *wrong*, because on real data there is nothing to check the
+answer against. This document manufactures that missing reference.
+
+The input is a single **reference file**, `las_1`, already known to be correctly
+aligned - by construction or by careful manual work. A known transform is then
+applied to a copy of `las_1`, deliberately knocking it out of alignment by an
+amount that is recorded, while the untouched `las_1` remains the reference. The
+result is a new `.las` that looks like
+an ordinary unaligned sample to the pipeline, and a `.csv` that says exactly what
+the pipeline is supposed to find.
+
+**One run produces a sweep, not a sample.** Give it a list of reference files and
+a vector of tilt magnitudes and it generates every combination - one `.las`, one
+forward matrix, one backward matrix and one truth row per (reference x tilt) -
+plus a single consolidated Reference CSV covering every sample in the run and a
+ready-made `las_pairs` for the batch driver. Everything else about the forward
+transform is held constant, so the tilt is the only variable and any change in
+the pipeline's error across the sweep is attributable to it.
+
+**The direction of the numbers matters and is the easiest thing to get wrong.**
+The parameters entered below are the *forward* transform - the damage done to a
+correct cloud. What the pipeline has to solve for is the *inverse* - the repair.
+They are not the same numbers, and for the rotation they are not even the same
+numbers with a minus sign in front: inverting a tilt-plus-yaw rotation turns the
+tilt direction around by roughly 180 degrees *and* shifts it by the yaw. Both
+sets are computed and both are written to the CSV, under names that say which is
+which. **The `target_*` columns are the ones to score the pipeline against.**
+
+The eight error terms this exists to support
+
+Once the pipeline has run on the generated sample, each of these is a
+subtraction against a `target_*` column:
+
+| Error term | Compared against |
+|---|---|
+| full XYZ rotation | `target_rot_total_deg` (and the full matrix `target_R_*`) |
+| XY-only rotation (tilt) | `target_rot_xy_mag_deg`, `target_rot_xy_dir_deg` |
+| Z-only rotation (yaw) | `target_rot_z_deg` |
+| X-only shift | `target_shift_x_m` |
+| Y-only shift | `target_shift_y_m` |
+| Z-only shift | `target_shift_z_m` |
+| XY shift | `target_shift_xy_m` |
+| XYZ shift | `target_shift_xyz_m` |
+
+Rotation errors are **not** taken as differences of the reported angles - that is
+wrong whenever more than one axis is involved, because angles about different
+axes do not subtract. They are taken from the residual rotation
+$R_{\text{err}} = R_{\text{recovered}} R_{\text{target}}^{\top}$, which is the
+rotation still left over after the pipeline's answer has been applied. Its total
+angle, its tilt and its yaw are the three rotation errors. Stage 6 does this.
+
+The pivot travels with the sample
+
+A rotation is meaningless without the point it turned about, and the pipeline
+can use the shifted  pivot point used here.  the shifted pivot is written into the exported cloud
+as a single extra point carrying a `PivotPoint` scalar field set to 1. It is
+visible in CloudCompare, it survives the round trip, and it lets any later
+comparison be re-expressed about the correct origin. It is also written to the
+CSV, which is the copy to trust - a LAS stores coordinates as scaled integers, so
+the point in the cloud is quantised to the file's scale factor.
+
+The marker box - a reference made of geometry rather than of matrices
+
+The eight terms above are all read off a transform. That is a statement about a
+matrix, and a matrix is only as meaningful as the frame and the pivot it is
+expressed in. So this generator also plants a physical reference in the cloud:
+the eight vertices of the reference cloud's bounding box, written into the
+sample **twice**.
+
+| `TargetBox` | `BoxCorner` | what it is |
+|---|---|---|
+| 1 | 1-8 | the eight corners where they belong - never transformed |
+| 2 | 1-8 | the same eight corners, put through the forward transform |
+
+Corner *n* of box 2 is the same corner as corner *n* of box 1, so the two boxes
+difference without any nearest-neighbour guesswork. Once the pipeline has run,
+Stage 6 applies the transform it solved to the box-2 corners; a perfect answer
+lands each one exactly on its box-1 twin. What is left is a displacement in
+metres, measured on the geometry, with no pivot convention anywhere in it. That
+is what Stage 6 now reports as the primary shift residual - the matrix-based
+terms above are still computed and still written, beside it.
+
+Order of operations
+
+1. shift `las_1` by `(dx, dy, dz)`
+2. move the pivot by the same `(dx, dy, dz)`
+3. compose the rotation from the tilt and yaw parameters
+4. rotate the shifted cloud about the shifted pivot
+
+Shift first, then rotate about the moved pivot. Written out:
+
+$$p' = R\,\big(p + t - c_{\text{shifted}}\big) + c_{\text{shifted}},
+\qquad c_{\text{shifted}} = c + t$$
+
+Because the pivot is carried along by the shift, the two operations do not
+interfere: the rotation sees the cloud in exactly the same relative position to
+its pivot as before the shift. That is what makes the inverse clean.
+
+# Stage 0 - Setup
+
+## 0.1 Load libraries
+
+```{r}
+#| label: libraries
+#| code-summary: "Load libraries and set the plot theme"
+
+suppressPackageStartupMessages({
+  library(lidR)
+  library(data.table)
+  library(dplyr)
+  library(ggplot2)
+  library(plotly)
+})
+```
+
+## 0.2 Global Helpers
+
+```{r}
+#| label: global-helpers
+#| code-summary: "Colours, ggplot theme, non-overwriting paths, rotation builders and the exact decomposer"
+
+# ============================================================
+# Colours
+# ============================================================
+COL_1 <- "#4C72B0"   # las_1 - the reference cloud (also the one that gets damaged)
+COL_P <- "#BF9ACA"   # the pivot point
+COL_B <- "#C44E52"   # the truth marker box (TargetBox = 1)
+
+# ============================================================
+# ggplot theme
+# ============================================================
+theme_set(
+  theme_minimal(base_size = 11) +
+    theme(panel.grid.minor = element_blank(),
+          plot.title       = element_text(face = "bold"),
+          strip.text       = element_text(face = "bold"))
+)
+
+# ============================================================
+# Non-overwriting output paths
+# Identical in behaviour to the pipeline's .unique_path: a write never
+# clobbers an existing file, it appends _001, _002, ... until the name is
+# free. Repeated here rather than sourced so this document stands alone.
+# ============================================================
+.unique_path <- function(path) {
+  if (!file.exists(path)) return(path)
+  base_noext <- tools::file_path_sans_ext(path)
+  ext        <- tools::file_ext(path)
+  counter    <- 1L
+  repeat {
+    candidate <- sprintf("%s_%03d.%s", base_noext, counter, ext)
+    if (!file.exists(candidate)) {
+      cat(sprintf("Target already exists - using unique name: %s\n", candidate))
+      return(candidate)
+    }
+    counter <- counter + 1L
+  }
+}
+
+# ============================================================
+# Rotation builders
+#
+# THE TILT BUILDER IS COPIED FROM THE PIPELINE, deliberately and byte for
+# byte (Stage 3, .tilt_rotation_matrix). If this document built its tilt a
+# different way, every truth value it wrote would be expressed in a
+# convention the pipeline does not use, and the errors it produced would be
+# measuring the mismatch between two conventions rather than the pipeline's
+# accuracy. If the pipeline's builder is ever edited, edit this one too.
+#
+# Convention, verified rather than assumed: for R = .tilt_rotation_matrix(m, d),
+#   R %*% c(0, 0, 1) = (sin m cos d, sin m sin d, cos m)
+# so the tilt magnitude is exactly m and the azimuth of the rotated +Z axis is
+# exactly d, CCW from +X. That is the same quantity the pipeline's own
+# .rot_specs() reports as tilt / tilt_dir, so a value entered here comes back
+# out of the pipeline's reports under the same name and meaning.
+#
+# (The pipeline's comment on this function claims points lying in direction_deg
+# move in +Z. They move in -Z; the +Z AXIS is what tips toward direction_deg.
+# The matrix is right, the comment is not - and it is the matrix that both
+# documents share, so nothing downstream is affected.)
+# ============================================================
+.tilt_rotation_matrix <- function(magnitude_deg, direction_deg) {
+  m <- magnitude_deg * pi / 180
+  d <- direction_deg * pi / 180
+  axis <- c(-sin(d), cos(d), 0)          # horizontal axis, perpendicular to direction
+  ax <- axis[1]; ay <- axis[2]; az <- axis[3]
+  K <- matrix(c(  0, -az,  ay,
+                 az,   0, -ax,
+                -ay,  ax,   0), nrow = 3, byrow = TRUE)
+  diag(3) + sin(m) * K + (1 - cos(m)) * (K %*% K)
+}
+
+# Yaw: a rotation of `deg` about +Z, CCW seen from above, matching the sign
+# convention Stage 5 / Stage 6 use for z_rotation_deg.
+.yaw_rotation_matrix <- function(deg) {
+  a <- deg * pi / 180
+  R <- diag(3)
+  R[1:2, 1:2] <- matrix(c(cos(a), -sin(a),
+                          sin(a),  cos(a)), nrow = 2, byrow = TRUE)
+  R
+}
+
+# ============================================================
+# The composition order, and why this one
+#
+#     R = tilt(m, d) %*% yaw(a)          -> yaw applied FIRST, then tilt
+#
+# Not an arbitrary pick. Under this order the third column of R is
+# tilt(m, d) %*% c(0,0,1) untouched by the yaw, so m and d read straight back
+# off the finished matrix and the numbers entered in Step 0.4 are literally
+# the numbers the matrix carries. Under the other order (tilt first, then yaw)
+# the yaw rotates the tilt direction, and a matrix built from d = 20 reports a
+# tilt direction of d + a. Both are valid rotations; only one lets a user
+# check the composed matrix against what they typed.
+# ============================================================
+.compose_rotation <- function(xy_mag_deg, xy_dir_deg, z_deg) {
+  .tilt_rotation_matrix(xy_mag_deg, xy_dir_deg) %*% .yaw_rotation_matrix(z_deg)
+}
+
+# ============================================================
+# EXACT decomposition, the inverse of .compose_rotation
+#
+# Given any rotation R, returns the unique (m, d, a) with
+# R = tilt(m, d) %*% yaw(a). This is a true factorisation, not a description:
+# the three numbers rebuild R to machine precision, and the caller can check
+# that (rebuild_err below). That distinction matters for the inverse
+# transform - a set of angles that merely DESCRIBES the repair is not something
+# anyone can apply.
+#
+#   m = acos(R[3,3])                third column is tilt(m,d) %*% z
+#   d = atan2(R[2,3], R[1,3])
+#   a = the residual yaw, read off tilt(m,d)^T %*% R
+#
+# Degenerate case: at m = 0 the tilt direction is undefined (there is no tilt
+# to point anywhere). d is reported as NA rather than as the 0 that atan2(0,0)
+# happens to return, because a direction of "0 degrees" and "no direction" are
+# different claims and only one of them is true.
+# ============================================================
+.decompose_rotation <- function(R, dir_tol_deg = 1e-9) {
+  m <- acos(max(-1, min(1, R[3, 3]))) * 180 / pi
+  d <- if (m < dir_tol_deg) NA_real_ else (atan2(R[2, 3], R[1, 3]) * 180 / pi) %% 360
+  M <- .tilt_rotation_matrix(m, if (is.na(d)) 0 else d) %*% .yaw_rotation_matrix(0)
+  M <- t(M) %*% R
+  a <- atan2(M[2, 1], M[1, 1]) * 180 / pi
+  total <- acos(max(-1, min(1, (sum(diag(R)) - 1) / 2))) * 180 / pi
+
+  rebuild <- .compose_rotation(m, if (is.na(d)) 0 else d, a)
+  list(xy_mag_deg  = m,
+       xy_dir_deg  = d,
+       z_deg       = a,
+       total_deg   = total,
+       rebuild_err = max(abs(rebuild - R)))
+}
+
+# ============================================================
+# Flatteners and the matrix writer
+# Used by the per-sample generator in Stage T. Defined here, once, because a
+# helper defined inside the loop is a helper redefined 28 times.
+# ============================================================
+
+# Matrices flattened to R_fwd_11 ... R_fwd_33 in ROW-major order, so they read
+# back with a single matrix(byrow = TRUE).
+.flat <- function(M, prefix) {
+  nm <- as.vector(t(outer(seq_len(nrow(M)), seq_len(ncol(M)),
+                          function(i, j) sprintf("%s_%d%d", prefix, i, j))))
+  stats::setNames(as.list(as.vector(t(M))), nm)
+}
+
+# The marker corners: box1_c1_x ... box2_c8_z. These are the EXACT coordinates -
+# the copies in the .las went through the file's scale factor and are quantised.
+# Stage 6 reads these in preference to the cloud's.
+.flat_box <- function(M, prefix) {
+  nm <- sprintf("%s_c%d_%s", prefix,
+                rep(seq_len(nrow(M)), each = 3L), rep(c("x", "y", "z"), nrow(M)))
+  stats::setNames(as.list(as.vector(t(M))), nm)
+}
+
+# Full double precision (17 significant digits, so the file round-trips
+# exactly), space-separated, no header - the same shape as the TLS-registration
+# matrix files elsewhere in the pipeline.
+.write_matrix_txt <- function(M, path) {
+  utils::write.table(format(M, digits = 17, scientific = FALSE), path,
+                     sep = " ", quote = FALSE, row.names = FALSE, col.names = FALSE)
+}
+
+# A rotation matrix, or not. Catches a scale, a shear or a reflection before
+# it is baked into a sample that will then be used to judge the pipeline.
+.validate_rotation <- function(R, nm = "R") {
+  if (!is.matrix(R) || !identical(dim(R), c(3L, 3L)))
+    stop(sprintf("[%s] is not a 3x3 matrix.", nm))
+  if (!isTRUE(all.equal(t(R) %*% R, diag(3), tolerance = 1e-9, check.attributes = FALSE)))
+    stop(sprintf("[%s] is not a rotation (R'R != I) - a scale or shear here would resize the stems.", nm))
+  if (det(R) < 0)
+    stop(sprintf("[%s] has determinant %.6f - a reflection, not a rotation.", nm, det(R)))
+  invisible(TRUE)
+}
+```
+
+## 0.3 Reference Files and the Tilt Sweep
+
+One run generates **one sample per (reference file × tilt magnitude)**. Four
+references and seven tilts is twenty-eight samples, each with its own `.las`,
+its own pair of matrix files, its own truth row, and a name that says which
+combination it is.
+
+The seven identifier fields are read off each **reference** cloud's filename
+rather than typed in beside it. The reference file already carries them:
+
+```
+R_SNBG_F1_a_2020_2024_TLS_TLS.las
+│  │    │  │  │    │    │   └── Scanner_2
+│  │    │  │  │    │    └────── Scanner_1
+│  │    │  │  │    └─────────── Epoch_2
+│  │    │  │  └──────────────── Epoch_1
+│  │    │  └─────────────────── Sample_Type_ID
+│  │    └────────────────────── Cluster_ID
+│  └─────────────────────────── Sample_location_ID
+└────────────────────────────── R = reference
+```
+
+and each generated sample is a damaged copy of that reference, so it takes the
+same seven fields under an `I_` prefix - `I` for input, the thing the pipeline
+is handed - plus the tilt magnitude that was applied to it, inserted after
+`Sample_Type_ID`:
+
+```
+R_SNBG_F1_a_2020_2024_TLS_TLS.las         one reference, untouched
+├── I_SNBG_F1_a_0p00_2020_2024_TLS_TLS.las
+├── I_SNBG_F1_a_1p04_2020_2024_TLS_TLS.las
+├── I_SNBG_F1_a_29p71_2020_2024_TLS_TLS.las
+└── ...                     └── tg_rot_xy_mag, degrees off vertical
+```
+
+The tilt is the one field that is *not* a property of the reference file - it
+is a property of the generation run, and it is the dial being swept. Putting it
+in the filename is what lets a directory of samples off one reference be told
+apart at a glance, and sorted by difficulty without opening any of them.
+
+Two consequences worth stating. The reference name has seven fields and a sample
+name has eight, so they do not round-trip: a sample name is built from a
+reference's fields, never parsed back into one. And the tilt is written `45p59`
+rather than `45.59`, because a period in a basename invites every tool that
+splits on it to find an extension where there is none.
+
+**Everything is validated before anything is generated.** Every reference file
+is checked for existence and parsed, and the full job table is built and checked
+for duplicate names, before the first cloud is read. A run of twenty-eight
+samples should not discover on sample nineteen that a filename does not parse.
+
+```{r}
+#| label: sample-inputs
+#| code-summary: "The reference clouds, and how their names are read"
+#| code-fold: false
+
+# ── Reference clouds: ALREADY KNOWN TO BE CORRECTLY ALIGNED ──────────────────
+# Each is loaded once, left untouched on disk, used for its own marker box, and
+# is the file whose name supplies the seven identifier fields. A copy of it is
+# what gets damaged to build each generated sample.
+reference_dir <- "C:/Users/ascsh/Documents/1_Artemis/11_PaqLab/115_TreeTimeAlign/Samples"
+
+reference_las_names <- c(
+  "R_SNBG_F1-F1006-F1125_a_2020_2024_TLS_TLS"
+)
+reference_las_paths <- file.path(reference_dir, paste0(reference_las_names, ".las"))
+
+# ── Where the identifiers come from ──────────────────────────────────────────
+# "parse"  -> split them out of each reference's basename. The normal mode.
+# "manual" -> use the seven values below for EVERY reference, which only makes
+#             sense with a single reference file. For one not yet named to the
+#             convention.
+sample_name_mode <- "parse"
+
+reference_prefix <- "R"   # stripped from the front of a reference basename
+sample_prefix    <- "I"   # I for input: what the pipeline is handed
+
+# Used only when sample_name_mode is "manual". Left in the parsed order so the
+# two modes cannot disagree about which field is which.
+manual_ids <- list(
+  Sample_location_ID = "SNBG",
+  Cluster_ID         = "F1",
+  Sample_Type_ID     = "a",
+  Epoch_1            = "2020",
+  Epoch_2            = "2024",
+  Scanner_1          = "TLS",
+  Scanner_2          = "TLS"
+)
+
+id_order <- c("Sample_location_ID", "Cluster_ID", "Sample_Type_ID",
+              "Epoch_1", "Epoch_2", "Scanner_1", "Scanner_2")
+
+#' The seven fields from one reference basename.
+#'
+#' Returns a named list in id_order. Stops rather than falling back: a fallback
+#' would name a sample after a file it did not come from, and that name goes
+#' into the truth CSV and from there into every downstream report.
+.parse_ids <- function(path) {
+  if (identical(sample_name_mode, "manual")) return(manual_ids[id_order])
+
+  ref_base <- tools::file_path_sans_ext(basename(path))
+
+  # The prefix is stripped only if it is actually there, so a reference already
+  # named bare parses the same way. A file named "Reference_..." is not silently
+  # mistaken for a prefix plus six fields - the field count catches it.
+  stem  <- sub(sprintf("^%s_", reference_prefix), "", ref_base)
+  parts <- strsplit(stem, "_", fixed = TRUE)[[1]]
+
+  if (length(parts) != length(id_order))
+    stop(sprintf(paste0("[0.3] A reference filename does not parse into %d fields.\n",
+                        "  file    : %s\n  stem    : %s\n  found   : %d field(s): %s\n",
+                        "  expected: %s\n",
+                        "  Rename it to %s_<%s>.las, or set sample_name_mode <- \"manual\"."),
+                 length(id_order), ref_base, stem, length(parts),
+                 paste(parts, collapse = ", "),
+                 paste(id_order, collapse = ", "),
+                 reference_prefix, paste(id_order, collapse = ">_<")),
+         call. = FALSE)
+
+  # An empty field collapses two underscores into a name that no longer splits
+  # into its parts; a space inside one breaks it differently. Flagged rather
+  # than corrected - renaming a sample silently is worse than a warning.
+  if (any(!nzchar(parts)) || any(grepl("[[:space:]]", parts)))
+    warning(sprintf(paste0("Reference '%s' has an empty or space-containing field - the ",
+                           "sample name will not split back into its parts. The CSV ",
+                           "columns still will."), ref_base), call. = FALSE)
+
+  stats::setNames(as.list(parts), id_order)
+}
+
+if (!identical(sample_name_mode, "parse") && !identical(sample_name_mode, "manual"))
+  stop('sample_name_mode must be "parse" or "manual".')
+
+# ── Fail fast: every file, before any generation ─────────────────────────────
+.miss <- reference_las_paths[!file.exists(reference_las_paths)]
+if (length(.miss))
+  stop("These reference file(s) do not exist:\n  ", paste(.miss, collapse = "\n  "))
+
+cat(sprintf("%d reference file(s):\n", length(reference_las_paths)))
+for (.p in reference_las_paths)
+  cat(sprintf("  %-36s -> %s\n", basename(.p),
+              paste(unlist(.parse_ids(.p)), collapse = " | ")))   # stops here on a bad name
+rm(.miss, .p)
+```
+
+## 0.4 Input Parameters
+
+```{r}
+#| label: input-parameters
+#| code-summary: "Output directories, pivot mode, marker box, and the forward transform to apply"
+#| code-fold: false
+
+# ── Output directories, one per kind of artefact ─────────────────────────────
+las_output_dir    <- "C:/Users/ascsh/Documents/1_Artemis/11_PaqLab/115_TreeTimeAlign/Samples"
+csv_output_dir    <- "C:/Users/ascsh/Documents/1_Artemis/11_PaqLab/115_TreeTimeAlign/ReferenceCSV"
+matrix_output_dir <- "C:/Users/ascsh/Documents/1_Artemis/11_PaqLab/115_TreeTimeAlign/TestSampleGen/ForwardBackward"
+
+# ── Consolidated outputs, in csv_output_dir ──────────────────────────────────
+# ONE file covering every reference and every tilt in the run. This is the file
+# to hand the batch driver as truth_csv_path: it keys on sample_name and holds
+# one row per sample, which is exactly the shape RunR splits back apart per
+# pair. The per-sample CSVs below are a convenience, not the deliverable.
+# The name is yours to set. It names a SWEEP, not a sample - every reference and
+# every tilt in the run lands in this one file - so it is named after the
+# reference set rather than after any row in it.
+consolidated_csv_name  <- "SNBG_F1-F1006-F1125_a_2020_2024_TLS_TLS.csv"
+consolidated_truth_csv <- file.path(csv_output_dir, consolidated_csv_name)
+
+# One row per sample, written beside the consolidated file. OFF: the driver now
+# resolves every path it needs from the consolidated table, so twenty-eight
+# extra single-row files were twenty-eight more things to keep in step with it.
+# Turn it on if you need to hand one sample to something on its own - Stage 1's
+# "csv" pivot mode, for instance, wants a single-row file.
+export_per_sample_csv <- FALSE
+
+# Also write an untransformed copy of each reference beside its samples, so a
+# pair can be handed to the pipeline as a self-contained unit. Written once per
+# reference, not once per tilt.
+export_reference_copy <- FALSE
+
+# Sample names encode the tilt, so two runs producing the same name are
+# producing the same sample. TRUE overwrites it; FALSE parks the second at _1,
+# which across a sweep leaves a directory of near-duplicates whose names no
+# longer identify them uniquely - and a consolidated CSV whose sample_name
+# column no longer matches the files beside it.
+overwrite_existing <- TRUE
+
+# ── Pivot ────────────────────────────────────────────────────────────────────
+# "auto"   -> the centre of the bounding box of the UNSHIFTED reference. This is
+#             the same definition Stage 1 uses for pivot1 (the mid-point of the
+#             cloud's EXTENT in all three axes, not the centroid of its points),
+#             so the generated sample is turned about the same kind of point the
+#             pipeline will later turn it back about. Note the Stage 1 caveat
+#             applies here too: the extent is sensitive to a single stray return.
+# "custom" -> pivot_custom below, in world coordinates. Used for EVERY
+#             reference, which rarely makes sense with more than one.
+pivot_mode   <- "auto"
+pivot_custom <- c(395295.465375, 5309905.28875, 266.084)
+
+# ── The forward transform: the damage to inflict ─────────────────────────────
+# These are NOT what the pipeline has to solve for. They are the opposite of it.
+# T.7 computes the targets.
+#
+# Shift, in metres, applied in world coordinates. Constant across the sweep: the
+# point of the sweep is to vary the tilt and nothing else, so that any change in
+# the pipeline's error is attributable to the tilt.
+tg_shift_x <- +0.029
+tg_shift_y <- +90.345
+tg_shift_z <- +15.101
+
+# Tilt (the "XY rotation"): how far off vertical, and which way.
+#   magnitude - degrees away from vertical. A VECTOR: one sample per entry, per
+#               reference file. A single value still works - it is a sweep of
+#               length one.
+#   direction - azimuth the +Z axis tips TOWARD, degrees CCW from +X, [0, 360)
+tg_rot_xy_mag <- c(0, 45, 90, 135, 180)
+tg_rot_xy_dir <- 20.85
+
+# Yaw (the "Z rotation"): degrees about the vertical axis, CCW seen from above.
+tg_rot_z <- 8.2400
+
+# tg_rot_xy_mag also goes into the output filename, after Sample_Type_ID. Two
+# decimals is enough to tell a swept series apart without making the name
+# unreadable; the CSV carries the value at full precision either way, so nothing
+# depends on this being exact.
+tilt_tag_digits <- 2
+
+# ── The pivot point written into the cloud ───────────────────────────────────
+# TreeID is left empty on that point so no stem-wise step can ever pick it up as
+# a stem. NA is the honest value; if the writer or a downstream reader rejects
+# NA in that field, 0L is the fallback - it is the value the pipeline already
+# treats as "not a tree".
+pivot_treeid_value <- NA_integer_
+pivot_field_name   <- "PivotPoint"
+
+# ── The marker box written into the cloud ────────────────────────────────────
+# Eight points at the vertices of a bounding box, written into the sample twice:
+# once where they belong (TargetBox = 1, never transformed) and once put through
+# the forward transform (TargetBox = 2). BoxCorner carries 1..8 on both copies.
+#
+# The box is built from the bounding box of the untransformed reference - the
+# frame the pipeline is trying to get back to - once per reference, so every
+# tilt off that reference is scored against the same eight points.
+#
+# The box is a bounding box, not a fit: a single stray return stretches it. That
+# does not matter here. The corners are not measurements of anything, they are
+# arbitrary points chosen to be far apart and unambiguously labelled - what is
+# measured is how far each one moves, and any eight fixed points would serve.
+# Spread is the only property that counts, because a rotation error shows up as
+# displacement in proportion to the lever arm.
+box_source_cloud  <- "reference"     # the only cloud there is
+box_field_name    <- "TargetBox"     # 0 = ordinary point, 1 = truth, 2 = moved
+corner_field_name <- "BoxCorner"     # 1..8 on the marker points, 0 elsewhere
+box_treeid_value  <- NA_integer_     # as with the pivot: never a stem
+```
+
+## 0.4b Build the Job Table
+
+Every sample this run will produce, named and checked, before any cloud is read.
+The table is the cartesian product of the references and the tilts.
+
+```{r}
+#| label: build-job-table
+#| code-summary: "reference x tilt, with the output name for each"
+
+# The tag has to survive being put in a filename and read back, so: a period
+# becomes "p" (a period in a basename invites tools to find an extension where
+# there is none) and a minus becomes "m" (a leading dash is a command-line
+# option on every platform that has a command line). A tilt magnitude should
+# never be negative - .decompose_rotation returns it in [0, 180] - but the name
+# is built before anything has validated that, so it is handled rather than
+# assumed.
+.tilt_tag <- function(mag) {
+  s <- formatC(mag, format = "f", digits = tilt_tag_digits)
+  gsub("-", "m", gsub(".", "p", s, fixed = TRUE), fixed = TRUE)
+}
+
+jobs <- do.call(rbind, lapply(seq_along(reference_las_paths), function(r) {
+  ids <- .parse_ids(reference_las_paths[r])
+  do.call(rbind, lapply(seq_along(tg_rot_xy_mag), function(k) {
+    tag <- .tilt_tag(tg_rot_xy_mag[k])
+    data.frame(
+      ref_index   = r,
+      tilt_index  = k,
+      ref_path    = reference_las_paths[r],
+      # I_<location>_<cluster>_<type>_<tilt>_<epoch1>_<epoch2>_<scanner1>_<scanner2>
+      sample_name = paste(c(sample_prefix,
+                            ids$Sample_location_ID, ids$Cluster_ID,
+                            ids$Sample_Type_ID, tag,
+                            ids$Epoch_1, ids$Epoch_2,
+                            ids$Scanner_1, ids$Scanner_2),
+                          collapse = "_"),
+      tilt_mag    = tg_rot_xy_mag[k],
+      tilt_tag    = tag,
+      as.data.frame(ids, stringsAsFactors = FALSE),
+      stringsAsFactors = FALSE
+    )
+  }))
+}))
+
+# ── Duplicate names ──────────────────────────────────────────────────────────
+# Two jobs sharing a name would overwrite each other's .las and put two rows
+# with the same sample_name into the consolidated CSV - the one column every
+# downstream join keys on. Caught here, where the cause is visible, rather than
+# as a mysteriously short output directory.
+.dupes <- unique(jobs$sample_name[duplicated(jobs$sample_name)])
+if (length(.dupes))
+  stop(sprintf(paste0("%d job(s) share a name:\n  %s\n",
+                      "Two tilts that round to the same %d-decimal tag collide. ",
+                      "Raise tilt_tag_digits, or remove the duplicate tilt."),
+               length(.dupes), paste(.dupes, collapse = "\n  "), tilt_tag_digits))
+
+# Rounding that does not collide is still worth knowing about: the name will
+# claim a tilt the sample does not exactly have.
+.rounded <- tg_rot_xy_mag[
+  abs(as.numeric(vapply(tg_rot_xy_mag,
+                        function(m) formatC(m, format = "f", digits = tilt_tag_digits),
+                        character(1))) - tg_rot_xy_mag) > 1e-9]
+
+cat(sprintf("%d job(s): %d reference file(s) x %d tilt(s)\n",
+            nrow(jobs), length(reference_las_paths), length(tg_rot_xy_mag)))
+cat(sprintf("  tilts: %s deg\n",
+            paste(formatC(tg_rot_xy_mag, format = "f", digits = 3), collapse = ", ")))
+if (length(.rounded))
+  cat(sprintf(paste0("  note: %s deg round to a shorter name tag (%d dp) - the name claims a\n",
+                     "        tilt the sample does not exactly have. The CSV keeps full precision.\n"),
+              paste(.rounded, collapse = ", "), tilt_tag_digits))
+cat(sprintf("  shift (constant across the sweep): (%+.3f, %+.3f, %+.3f) m | %.3f m\n",
+            tg_shift_x, tg_shift_y, tg_shift_z,
+            sqrt(tg_shift_x^2 + tg_shift_y^2 + tg_shift_z^2)))
+cat(sprintf("  yaw   (constant across the sweep): %.4f deg\n", tg_rot_z))
+cat("\n")
+print(jobs[, c("sample_name", "tilt_mag")], row.names = FALSE)
+
+# ── Which job gets the full narration ────────────────────────────────────────
+# Printing every check for twenty-eight samples buries the one that matters. One
+# job is run verbosely, with all the per-step output and the 3D figure; the rest
+# report one line each. Every check still RUNS on every job - only the printing
+# is suppressed.
+detail_job <- 1L
+if (detail_job < 1L || detail_job > nrow(jobs))
+  stop(sprintf("detail_job must be between 1 and %d.", nrow(jobs)))
+cat(sprintf("\nFull narration for job %d: %s\n", detail_job, jobs$sample_name[detail_job]))
+
+rm(.dupes, .rounded)
+```
+
+# Stage T - Build the Test Samples
+
+Everything from the pivot to the truth row now lives in one function, called
+once per job. There is one implementation, not one for the single-sample case
+and another for the sweep, because two implementations of the same transform
+drift apart and the drift shows up as a truth file that is quietly wrong.
+
+**One reordering from the single-sample version:** the inverse transform and all
+its checks now run *before* anything is written. In a sweep, a sample that fails
+its round-trip check would otherwise already be on disk - a file that looks
+ordinary with no way to know its truth values are wrong. Now nothing is written
+until every check has passed, so the presence of a file is itself the guarantee.
+
+The work that depends only on the reference cloud - loading it, the marker box,
+the pivot - is done once per reference in the driver below. Only `R_fwd` and
+what follows from it varies with the tilt.
+
+## T.0 The Per-Sample Generator
+
+```{r}
+#| label: generate-sample-fn
+#| code-summary: "T.1 - T.8 for one job: pivot, shift, rotate, markers, invert, check, write"
+
+#' Generate one test sample.
+#'
+#' @param job one row of `jobs`
+#' @param las_ref the reference cloud, already loaded
+#' @param box_xyz_1 8x3 truth corners, built once per reference
+#' @param pivot_base the unshifted pivot, resolved once per reference
+#' @param verbose print every step's checks, as the single-sample document did
+#' @param keep_coords return the before/after coordinates, for the figure. Off
+#'   by default: twenty-eight clouds held at once is not a memory budget.
+.generate_sample <- function(job, las_ref, box_xyz_1, pivot_base,
+                             verbose = FALSE, keep_coords = FALSE) {
+
+  .v <- function(...) if (isTRUE(verbose)) cat(...)
+  box_corner_id <- seq_len(nrow(box_xyz_1))
+
+  # ── T.1 Pivot ──────────────────────────────────────────────────────────────
+  tg_shift <- c(tg_shift_x, tg_shift_y, tg_shift_z)
+
+  # The pivot is a point in the cloud's frame, so when the cloud moves it moves.
+  # Rotating the shifted cloud about the UNSHIFTED pivot would be a rotation
+  # about a point that is no longer where it was in the geometry - the rotation
+  # would then carry a translation of its own, that translation would fold
+  # silently into the shift, and the "known" shift written to the CSV would no
+  # longer be the shift the sample actually has.
+  pivot_shifted <- pivot_base + tg_shift
+
+  .v(sprintf("Pivot (base) : (%.4f, %.4f, %.4f)\n", pivot_base[1], pivot_base[2], pivot_base[3]))
+  .v(sprintf("Shift applied: (%+.4f, %+.4f, %+.4f) m\n", tg_shift[1], tg_shift[2], tg_shift[3]))
+  .v(sprintf("Pivot (moved): (%.4f, %.4f, %.4f)  <- the rotation origin\n",
+             pivot_shifted[1], pivot_shifted[2], pivot_shifted[3]))
+
+  # ── T.2 Apply the shift ────────────────────────────────────────────────────
+  xyz_base    <- as.matrix(las_ref@data[, c("X", "Y", "Z")])
+  xyz_shifted <- sweep(xyz_base, 2, tg_shift, `+`)
+
+  # ── T.3 Compose the rotation ───────────────────────────────────────────────
+  R_fwd <- .compose_rotation(job$tilt_mag, tg_rot_xy_dir, tg_rot_z)
+  .validate_rotation(R_fwd, "R_fwd")
+
+  # Read the finished matrix back through the decomposer and check it returns
+  # the inputs. This is a real test, not a tautology: the composer and the
+  # decomposer are written independently, and if the two ever fall out of step -
+  # a sign flip, a changed order - this catches it here, rather than three
+  # samples later when the errors all come out suspiciously large in one
+  # direction.
+  chk <- .decompose_rotation(R_fwd)
+  .v("\n── Forward rotation ──────────────────────────────────────────────────────\n")
+  .v(sprintf("  composition order  : tilt(mag, dir) %%*%% yaw(z)  (yaw first, then tilt)\n"))
+  .v(sprintf("  XY rotation mag    : %8.4f deg   (entered %8.4f)\n", chk$xy_mag_deg, job$tilt_mag))
+  .v(sprintf("  XY rotation dir    : %8.4f deg   (entered %8.4f)\n", chk$xy_dir_deg, tg_rot_xy_dir %% 360))
+  .v(sprintf("  Z rotation (yaw)   : %8.4f deg   (entered %8.4f)\n", chk$z_deg, tg_rot_z))
+  .v(sprintf("  full XYZ magnitude : %8.4f deg   (about the matrix's own axis)\n", chk$total_deg))
+  .v(sprintf("  round-trip error   : %.2e\n", chk$rebuild_err))
+
+  # At a tilt of exactly 0 there is no tilt to point anywhere, so the decomposer
+  # returns NA for the direction rather than the 0 that atan2(0,0) happens to
+  # give. The magnitude and yaw are still checked; the direction check is
+  # skipped, because a value undefined by construction is not a disagreement.
+  # A tilt of exactly 180 is the other degenerate case - the +Z axis lands on
+  # -Z and every direction reaches it - and the same reasoning applies.
+  tol <- 1e-8
+  if (abs(chk$xy_mag_deg - job$tilt_mag) > tol ||
+      (!is.na(chk$xy_dir_deg) &&
+       abs(((chk$xy_dir_deg - tg_rot_xy_dir + 180) %% 360) - 180) > tol) ||
+      abs(chk$z_deg - tg_rot_z) > tol)
+    stop(sprintf(paste0("[T.3] The composer and the decomposer disagree on '%s'. One of them ",
+                        "has been edited without the other; do not generate samples until ",
+                        "they match."), job$sample_name), call. = FALSE)
+
+  # ── T.4 Rotate about the shifted pivot ─────────────────────────────────────
+  xyz_final <- sweep(t(R_fwd %*% t(sweep(xyz_shifted, 2, pivot_shifted))), 2, -pivot_shifted)
+
+  # A rotation plus a translation cannot change any distance between two points.
+  # .validate_rotation already ruled out a scale in the matrix; this catches an
+  # error in how it was APPLIED - a transposed multiply, a pivot subtracted on
+  # the wrong side. Sampled rather than exhaustive, which is enough: an
+  # application error is systematic and shows up on any pair.
+  set.seed(1L)
+  .i  <- sample.int(nrow(xyz_base), min(2000L, nrow(xyz_base)))
+  .j  <- sample.int(nrow(xyz_base), min(2000L, nrow(xyz_base)))
+  rig <- max(abs(sqrt(rowSums((xyz_base[.i, ]  - xyz_base[.j, ])^2)) -
+                 sqrt(rowSums((xyz_final[.i, ] - xyz_final[.j, ])^2))))
+  if (rig > 1e-6)
+    stop(sprintf("[T.4] The transform is not rigid on '%s' (max distance change %.3e m).",
+                 job$sample_name, rig), call. = FALSE)
+  .v(sprintf("\nRigidity check: max pairwise distance change %.3e m over %d sampled pairs\n",
+             rig, length(.i)))
+
+  disp <- sqrt(rowSums((xyz_final - xyz_base)^2))
+  .v(sprintf("Net point displacement: min %.4f m | median %.4f m | max %.4f m\n",
+             min(disp), median(disp), max(disp)))
+  .v("  (the rotation contributes more the further a point sits from the pivot,\n")
+  .v("   so the spread here is a lever-arm effect, not an inconsistency)\n")
+
+  # ── T.4b The marker box ────────────────────────────────────────────────────
+  # The SAME two operations, in the same order, about the same shifted pivot.
+  # Written as one expression rather than by reusing xyz_shifted, so the cloud's
+  # path and the box's path cannot drift apart if one of them is later edited.
+  box_xyz_2 <- sweep(
+    t(R_fwd %*% t(sweep(sweep(box_xyz_1, 2, tg_shift, `+`), 2, pivot_shifted))),
+    2, -pivot_shifted)
+
+  # Same rigidity argument on eight points instead of two thousand - cheap
+  # enough here to be exhaustive: all 28 pairwise distances.
+  erg <- max(abs(as.numeric(dist(box_xyz_1)) - as.numeric(dist(box_xyz_2))))
+  if (erg > 1e-6)
+    stop(sprintf("[T.4b] The marker box was not moved rigidly on '%s' (max edge change %.3e m).",
+                 job$sample_name, erg), call. = FALSE)
+
+  bd <- sqrt(rowSums((box_xyz_2 - box_xyz_1)^2))
+  .v(sprintf("\nMarker box transformed | edge-length change %.3e m (must be ~0)\n", erg))
+  .v(sprintf("Corner displacement: min %.4f m | mean %.4f m | max %.4f m\n",
+             min(bd), mean(bd), max(bd)))
+  .v("  (this is the displacement Stage 6 has to undo. Corners far from the pivot\n")
+  .v("   move further - that lever arm is the whole point of putting them at the\n")
+  .v("   extremes of the plot rather than near its centre)\n")
+  if (isTRUE(verbose)) {
+    cat(sprintf("\n  %-8s %12s %12s %12s %12s\n", "corner", "dx (m)", "dy (m)", "dz (m)", "|d| (m)"))
+    for (i in box_corner_id)
+      cat(sprintf("  %-8d %12.4f %12.4f %12.4f %12.4f\n", i,
+                  box_xyz_2[i, 1] - box_xyz_1[i, 1],
+                  box_xyz_2[i, 2] - box_xyz_1[i, 2],
+                  box_xyz_2[i, 3] - box_xyz_1[i, 3], bd[i]))
+  }
+
+  # ── T.7 Invert, and check EVERYTHING before anything is written ────────────
+  R_inv <- t(R_fwd)                    # for a rotation, the inverse is the transpose
+  .validate_rotation(R_inv, "R_inv")
+  inv <- .decompose_rotation(R_inv)
+
+  # Straight negation - but only because the pivot was carried along in T.1.
+  target_shift <- -tg_shift
+
+  # Undoing "shift, then rotate about the moved pivot" means rotating back about
+  # the moved pivot, then shifting back:
+  #     x_base = (R_inv (x_sample - c') + c') - t
+  T_inv <- diag(4)
+  T_inv[1:3, 1:3] <- R_inv
+  T_inv[1:3, 4]   <- as.numeric(pivot_shifted - R_inv %*% pivot_shifted - tg_shift)
+
+  # The forward map in the same one-matrix form. Note the shift enters ROTATED -
+  #     x_sample = R (x_base + t - c') + c'  =  R x_base + [R t + c' - R c']
+  # so the translation column is R %*% t, not t. Only the INVERSE gets a plain
+  # -t, because there the shift is undone after the rotation rather than before
+  # it. Writing t here instead of R t is a millimetre-scale error at these
+  # angles, which is exactly the size of error this document exists to measure.
+  T_fwd <- diag(4)
+  T_fwd[1:3, 1:3] <- R_fwd
+  T_fwd[1:3, 4]   <- as.numeric(R_fwd %*% tg_shift + pivot_shifted - R_fwd %*% pivot_shifted)
+
+  # Both matrices are checked against the coordinates actually produced, not
+  # just against each other - a pair of matrices can be mutually consistent and
+  # both wrong.
+  fchk <- max(abs(t(T_fwd[1:3, 1:3] %*% t(xyz_base) + T_fwd[1:3, 4]) - xyz_final))
+  if (fchk > 1e-6)
+    stop(sprintf("[T.7] T_fwd does not reproduce the generated cloud for '%s' (max %.3e m).",
+                 job$sample_name, fchk), call. = FALSE)
+
+  # Push the generated sample back through the inverse and require the original
+  # cloud. This is the one check that tests everything at once - composition
+  # order, pivot handling, the sign of the shift, the transpose.
+  rt <- max(abs(t(T_inv[1:3, 1:3] %*% t(xyz_final) + T_inv[1:3, 4]) - xyz_base))
+  if (rt > 1e-6)
+    stop(sprintf(paste0("[T.7] The inverse does not recover the reference for '%s' ",
+                        "(max residual %.3e m). Nothing was written."),
+                 job$sample_name, rt), call. = FALSE)
+
+  # The same check on the marker box, which is what Stage 6 actually scores
+  # against. If the inverse returns box 2 onto box 1 to machine precision here,
+  # any gap Stage 6 reports is the pipeline's error, not a defect in how the box
+  # was built or written.
+  brt <- max(abs(t(T_inv[1:3, 1:3] %*% t(box_xyz_2) + T_inv[1:3, 4]) - box_xyz_1))
+  if (brt > 1e-6)
+    stop(sprintf(paste0("[T.7] The inverse does not return the marker box onto its truth ",
+                        "copy for '%s' (max %.3e m). Nothing was written."),
+                 job$sample_name, brt), call. = FALSE)
+
+  .v(sprintf("\nForward 4x4 vs the applied transform       : max residual %.3e m\n", fchk))
+  .v(sprintf("Round trip (sample -> inverse -> reference): max residual %.3e m\n", rt))
+  .v(sprintf("Round trip (box 2 -> inverse -> box 1)     : max residual %.3e m\n", brt))
+
+  if (isTRUE(verbose)) {
+    cat("\n── Target values: what a perfect alignment run would report ──────────────\n")
+    cat(sprintf("  XY rotation mag    : %8.4f deg\n", inv$xy_mag_deg))
+    cat(sprintf("  XY rotation dir    : %8.4f deg\n", inv$xy_dir_deg))
+    cat(sprintf("  Z rotation (yaw)   : %8.4f deg\n", inv$z_deg))
+    cat(sprintf("  full XYZ magnitude : %8.4f deg\n", inv$total_deg))
+    cat(sprintf("  X shift            : %+8.5f m\n", target_shift[1]))
+    cat(sprintf("  Y shift            : %+8.5f m\n", target_shift[2]))
+    cat(sprintf("  Z shift            : %+8.5f m\n", target_shift[3]))
+    cat(sprintf("  XY shift magnitude : %8.5f m\n", sqrt(sum(target_shift[1:2]^2))))
+    cat(sprintf("  XYZ shift magnitude: %8.5f m\n", sqrt(sum(target_shift^2))))
+    cat(sprintf("  factorisation error: %.2e (angles rebuild R_inv exactly)\n", inv$rebuild_err))
+
+    # Worth reading rather than skipping: the inverse tilt is the SAME magnitude
+    # but points roughly the other way, and the yaw offsets it further. Anyone
+    # expecting the target direction to be tg_rot_xy_dir with a minus sign will
+    # mis-score every run.
+    if (!is.na(inv$xy_dir_deg)) {
+      cat(sprintf("\n  note: forward tilt dir %.4f deg -> target tilt dir %.4f deg (turned by %.4f deg,\n",
+                  tg_rot_xy_dir %% 360, inv$xy_dir_deg,
+                  (inv$xy_dir_deg - (tg_rot_xy_dir %% 360)) %% 360))
+      cat("        which is ~180 deg from the forward direction, shifted by the yaw - not simply its negative)\n")
+    }
+  }
+
+  # ── T.5 Assemble the cloud with its markers ────────────────────────────────
+  dt <- data.table::as.data.table(las_ref@data)
+  dt[, X := xyz_final[, 1]]
+  dt[, Y := xyz_final[, 2]]
+  dt[, Z := xyz_final[, 3]]
+
+  # Every extra row is a COPY of an existing row with its coordinates
+  # overwritten, not a row of NAs. A LAS point has required fields - Intensity,
+  # ReturnNumber, Classification and so on - and a writer will refuse, or
+  # silently write garbage, if they are missing. Copying a real point guarantees
+  # every one of them is valid without this document having to know which fields
+  # the file happens to carry.
+  template <- data.table::copy(dt[1L])
+  if ("TreeID" %in% names(template)) template[, TreeID := pivot_treeid_value]
+
+  pivot_row <- data.table::copy(template)
+  pivot_row[, `:=`(X = pivot_shifted[1], Y = pivot_shifted[2], Z = pivot_shifted[3])]
+
+  box_rows <- function(M, box_value) {
+    r <- data.table::copy(template[rep(1L, nrow(M))])
+    r[, `:=`(X = M[, 1], Y = M[, 2], Z = M[, 3])]
+    if ("TreeID" %in% names(r)) r[, TreeID := box_treeid_value]
+    r[, (box_field_name)    := as.integer(box_value)]
+    r[, (corner_field_name) := as.integer(box_corner_id)]
+    r[, (pivot_field_name)  := 0L]
+    r
+  }
+
+  # Defaults on the real points and on the pivot: not a marker, no corner. 0
+  # rather than NA, because a LAS extra byte has no NA and a reader that meets
+  # one will invent a value for it.
+  dt[, (pivot_field_name)  := 0L]
+  dt[, (box_field_name)    := 0L]
+  dt[, (corner_field_name) := 0L]
+  pivot_row[, (pivot_field_name)  := 1L]
+  pivot_row[, (box_field_name)    := 0L]
+  pivot_row[, (corner_field_name) := 0L]
+
+  box_1_rows <- box_rows(box_xyz_1, 1L)
+  box_2_rows <- box_rows(box_xyz_2, 2L)
+
+  dt <- data.table::rbindlist(list(dt, pivot_row, box_1_rows, box_2_rows),
+                              use.names = TRUE, fill = TRUE)
+
+  las_out <- LAS(dt, header = las_ref@header)
+  las_out <- lidR::las_update(las_out)   # refresh the header extent after moving every point
+
+  # Register each flag as a LAS extra byte, so it survives the write and appears
+  # as a named scalar field in CloudCompare rather than being dropped.
+  reg <- function(las, nm, desc) {
+    tryCatch(lidR::add_lasattribute(las, name = nm, desc = desc),
+             error = function(e)
+               lidR::add_lasattribute_manual(las, name = nm, desc = desc,
+                                             type = "int", NA_value = NULL))
+  }
+  las_out <- reg(las_out, pivot_field_name,
+                 "1 = rotation pivot used to generate this sample")
+  las_out <- reg(las_out, box_field_name,
+                 "1 = marker box at truth, 2 = marker box after the applied transform")
+  las_out <- reg(las_out, corner_field_name,
+                 "1-8 = which bounding-box vertex this marker is")
+
+  .v(sprintf("\nCloud assembled: %s points (%s original + 1 pivot + %d marker)\n",
+             format(nrow(las_out@data), big.mark = ","),
+             format(nrow(xyz_final), big.mark = ","),
+             nrow(box_1_rows) + nrow(box_2_rows)))
+
+  # ── T.6 Write the .las ─────────────────────────────────────────────────────
+  uniq <- function(p) if (isTRUE(overwrite_existing)) p else .unique_path(p)
+
+  las_path <- uniq(file.path(las_output_dir, paste0(job$sample_name, ".las")))
+  writeLAS(las_out, las_path)
+  .v(sprintf("Saved %s points -> %s\n", format(nrow(las_out@data), big.mark = ","), las_path))
+
+  # ── T.7b The forward and backward matrices, as matrices ────────────────────
+  # T.8 also writes both, flattened into sixteen columns each so a batch can be
+  # rbind'ed into one table. That layout is awkward for anything that just wants
+  # "the matrix". These are the same two matrices again, each as its own
+  # plain-text file: full double precision (17 significant digits, so the file
+  # round-trips exactly), space-separated, no header - the same shape as the
+  # TLS-registration matrix files elsewhere in the pipeline.
+  #
+  #   *_forward.txt  - T_fwd, reference -> sample. The damage applied. NOT what
+  #                    the pipeline solves for.
+  #   *_backward.txt - T_inv, sample -> reference. Score the pipeline's
+  #                    recovered matrix against this one.
+  fwd_path <- uniq(file.path(matrix_output_dir, paste0(job$sample_name, "_forward.txt")))
+  bwd_path <- uniq(file.path(matrix_output_dir, paste0(job$sample_name, "_backward.txt")))
+  .write_matrix_txt(T_fwd, fwd_path)
+  .write_matrix_txt(T_inv, bwd_path)
+  .v(sprintf("Saved forward  4x4 (reference -> sample) -> %s\n", fwd_path))
+  .v(sprintf("Saved backward 4x4 (sample -> reference) -> %s\n", bwd_path))
+
+  # ── T.8 The truth row ──────────────────────────────────────────────────────
+  # ONE ROW, MANY COLUMNS. A long/tidy layout reads better on screen but this
+  # exists to be stacked: one sample per row, joinable straight onto a table of
+  # pipeline results. Matrices are flattened to R_fwd_11 ... R_fwd_33 in
+  # row-major order so they read back with a single matrix(byrow = TRUE).
+  truth <- c(
+    list(
+      # ── identity ────────────────────────────────────────────────────────
+      sample_name        = job$sample_name,
+      Sample_location_ID = job$Sample_location_ID,
+      Cluster_ID         = job$Cluster_ID,
+      Sample_Type_ID     = job$Sample_Type_ID,
+      tilt_tag           = job$tilt_tag,
+      tilt_tag_digits    = tilt_tag_digits,
+      Epoch_1            = job$Epoch_1,
+      Epoch_2            = job$Epoch_2,
+      Scanner_1          = job$Scanner_1,
+      Scanner_2          = job$Scanner_2,
+      sample_prefix      = sample_prefix,
+      sample_name_mode   = sample_name_mode,
+      ref_index          = job$ref_index,
+      tilt_index         = job$tilt_index,
+      generated_utc      = format(Sys.time(), tz = "UTC", usetz = TRUE),
+      # The R_ cloud this sample was damaged from. NOT the las_2 the pipeline
+      # aligns against - that is a genuinely separate second epoch, and pairing
+      # a sample against the cloud it was cut from would score the pipeline on
+      # geometry it has already seen. Named reference_las_1 rather than
+      # baseline_las_1 so the two cannot be confused at a glance in the CSV.
+      reference_las_1    = job$ref_path,
+      sample_las         = las_path,
+      T_fwd_txt          = fwd_path,
+      target_T_txt       = bwd_path,
+      n_points_source    = nrow(xyz_final),
+      n_points_written   = nrow(las_out@data),
+
+      # ── marker box ──────────────────────────────────────────────────────
+      box_source_cloud   = box_source_cloud,
+      box_field_name     = box_field_name,
+      corner_field_name  = corner_field_name,
+      box_n_corners      = nrow(box_xyz_1),
+      box_diagonal_m     = sqrt(sum((apply(box_xyz_1, 2, max) - apply(box_xyz_1, 2, min))^2)),
+      box_corner_disp_max_m  = max(bd),
+      box_corner_disp_mean_m = mean(bd),
+
+      # ── pivot ───────────────────────────────────────────────────────────
+      pivot_mode         = pivot_mode,
+      pivot_base_x       = pivot_base[1],
+      pivot_base_y       = pivot_base[2],
+      pivot_base_z       = pivot_base[3],
+      pivot_shifted_x    = pivot_shifted[1],
+      pivot_shifted_y    = pivot_shifted[2],
+      pivot_shifted_z    = pivot_shifted[3],
+
+      # ── APPLIED: the damage done (NOT what the pipeline should report) ──
+      applied_shift_x_m      = tg_shift[1],
+      applied_shift_y_m      = tg_shift[2],
+      applied_shift_z_m      = tg_shift[3],
+      applied_shift_xy_m     = sqrt(sum(tg_shift[1:2]^2)),
+      applied_shift_xyz_m    = sqrt(sum(tg_shift^2)),
+      applied_rot_xy_mag_deg = job$tilt_mag,
+      applied_rot_xy_dir_deg = tg_rot_xy_dir %% 360,
+      applied_rot_z_deg      = tg_rot_z,
+      applied_rot_total_deg  = acos(max(-1, min(1, (sum(diag(R_fwd)) - 1) / 2))) * 180 / pi,
+      rotation_order         = "R = tilt(mag, dir) %*% yaw(z); shift applied before rotation",
+
+      # ── TARGET: what a perfect run reports. SCORE AGAINST THESE. ────────
+      target_shift_x_m      = target_shift[1],
+      target_shift_y_m      = target_shift[2],
+      target_shift_z_m      = target_shift[3],
+      target_shift_xy_m     = sqrt(sum(target_shift[1:2]^2)),
+      target_shift_xyz_m    = sqrt(sum(target_shift^2)),
+      target_rot_xy_mag_deg = inv$xy_mag_deg,
+      target_rot_xy_dir_deg = inv$xy_dir_deg,
+      target_rot_z_deg      = inv$z_deg,
+      target_rot_total_deg  = inv$total_deg,
+
+      # ── provenance of the checks ────────────────────────────────────────
+      factorisation_err         = inv$rebuild_err,
+      check_fwd_max_m           = fchk,
+      check_roundtrip_max_m     = rt,
+      check_box_roundtrip_max_m = brt,
+      check_rigidity_max_m      = rig
+    ),
+    .flat(R_fwd, "R_fwd"),
+    .flat(R_inv, "target_R"),
+    .flat(T_fwd, "T_fwd"),
+    .flat(T_inv, "target_T"),
+    # box1 = where the corners belong (the target), box2 = where they were moved to
+    .flat_box(box_xyz_1, "box1"),
+    .flat_box(box_xyz_2, "box2")
+  )
+
+  truth_df <- as.data.frame(truth, stringsAsFactors = FALSE)
+
+  if (isTRUE(export_per_sample_csv)) {
+    csv_path <- uniq(file.path(csv_output_dir, paste0(job$sample_name, ".csv")))
+    truth_df$sample_csv <- csv_path
+    utils::write.csv(truth_df, csv_path, row.names = FALSE)
+    .v(sprintf("Saved %d truth column(s) -> %s\n", ncol(truth_df), csv_path))
+  }
+
+  list(truth    = truth_df,
+       las_path = las_path,
+       summary  = list(rt = rt, brt = brt, disp_max = max(disp), box_disp_max = max(bd)),
+       coords   = if (isTRUE(keep_coords))
+                    list(xyz_base = xyz_base, xyz_final = xyz_final,
+                         box_xyz_1 = box_xyz_1, box_xyz_2 = box_xyz_2,
+                         pivot_base = pivot_base, pivot_shifted = pivot_shifted,
+                         rot_total = truth_df$applied_rot_total_deg)
+                  else NULL)
+}
+```
+
+## T.9 Run the Sweep
+
+The outer loop is over reference files, the inner over tilts. That order is not
+cosmetic: reading a cloud and computing its bounding box are the expensive parts
+and they depend only on the reference, so each file is read once and its marker
+box and pivot are built once, then reused across every tilt. Reading four files
+twenty-eight times would be seven times the I/O for identical results - and,
+worse, would rebuild the truth box each time, so the samples off one reference
+would no longer all be scored against the same eight points.
+
+A job that fails its checks is recorded and the sweep continues. The others are
+independent of it, and nothing was written for it.
+
+```{r}
+#| label: run-sweep
+#| code-summary: "Load each reference once, then generate every tilt from it"
+
+for (.d in c(las_output_dir, csv_output_dir, matrix_output_dir))
+  dir.create(.d, recursive = TRUE, showWarnings = FALSE)
+
+results  <- vector("list", nrow(jobs))
+failures <- list()
+detail   <- NULL
+t_start  <- Sys.time()
+
+for (r in unique(jobs$ref_index)) {
+
+  rows <- which(jobs$ref_index == r)
+  cat(sprintf("\n══ Reference %d/%d: %s ══════════════════════════════════\n",
+              r, length(unique(jobs$ref_index)), basename(jobs$ref_path[rows[1]])))
+
+  las_ref <- readLAS(jobs$ref_path[rows[1]])
+  if (is.empty(las_ref)) stop("Reference read as empty: ", jobs$ref_path[rows[1]])
+  cat(sprintf("  loaded %s points\n", format(nrow(las_ref@data), big.mark = ",")))
+
+  # ── The marker box, once per reference ─────────────────────────────────────
+  bx <- range(las_ref@data$X); by <- range(las_ref@data$Y); bz <- range(las_ref@data$Z)
+
+  # expand.grid varies its FIRST factor fastest, so the eight rows come out as
+  #   1 (xmin,ymin,zmin) 2 (xmax,ymin,zmin) 3 (xmin,ymax,zmin) 4 (xmax,ymax,zmin)
+  #   5 (xmin,ymin,zmax) 6 (xmax,ymin,zmax) 7 (xmin,ymax,zmax) 8 (xmax,ymax,zmax)
+  # i.e. the bottom face first, then the top, each in the same x-then-y order.
+  # Nothing downstream matches corners by proximity; corner 3 is compared with
+  # corner 3 because both files agree on which vertex that is.
+  box_xyz_1 <- as.matrix(expand.grid(X = bx, Y = by, Z = bz,
+                                     KEEP.OUT.ATTRS = FALSE)[, c("X", "Y", "Z")])
+  dimnames(box_xyz_1) <- NULL
+
+  cat(sprintf("  marker box: %.1f x %.1f x %.1f m | diagonal %.2f m (the longest lever\n",
+              diff(bx), diff(by), diff(bz),
+              sqrt(diff(bx)^2 + diff(by)^2 + diff(bz)^2)))
+  cat("              arm a rotation error has to act on)\n")
+
+  # ── The pivot, once per reference ──────────────────────────────────────────
+  pivot_base <- switch(pivot_mode,
+                       auto = c(mean(bx), mean(by), mean(bz)),
+                       custom = as.numeric(pivot_custom),
+                       stop('pivot_mode must be "auto" or "custom".'))
+  if (length(pivot_base) != 3L || anyNA(pivot_base))
+    stop("The pivot did not resolve to three finite coordinates.")
+  cat(sprintf("  pivot (%s): (%.3f, %.3f, %.3f)\n", pivot_mode,
+              pivot_base[1], pivot_base[2], pivot_base[3]))
+
+  if (isTRUE(export_reference_copy)) {
+    ref_out <- file.path(las_output_dir, basename(jobs$ref_path[rows[1]]))
+    if (!isTRUE(overwrite_existing)) ref_out <- .unique_path(ref_out)
+    writeLAS(las_ref, ref_out)
+    cat(sprintf("  reference copy -> %s\n", basename(ref_out)))
+    rm(ref_out)
+  }
+
+  # ── The tilts ──────────────────────────────────────────────────────────────
+  for (k in rows) {
+    job     <- jobs[k, ]
+    verbose <- identical(k, detail_job)
+
+    if (verbose)
+      cat(sprintf("\n── job %d/%d  %s  (full narration) ───────────────────\n",
+                  k, nrow(jobs), job$sample_name))
+
+    out <- tryCatch(
+      .generate_sample(job, las_ref, box_xyz_1, pivot_base,
+                       verbose = verbose, keep_coords = verbose),
+      error = function(e) {
+        # Recorded, not raised. The remaining jobs are independent of this one,
+        # and nothing was written for it - every check runs before every write.
+        failures[[length(failures) + 1L]] <<-
+          data.frame(sample_name = job$sample_name, tilt_mag = job$tilt_mag,
+                     error = conditionMessage(e), stringsAsFactors = FALSE)
+        NULL
+      })
+
+    if (is.null(out)) {
+      cat(sprintf("  [%2d/%d] %-46s FAILED - see the table below\n",
+                  k, nrow(jobs), job$sample_name))
+      next
+    }
+
+    results[[k]] <- out$truth
+    if (verbose) detail <- out$coords
+
+    cat(sprintf("  [%2d/%d] %-46s tilt %7.3f deg | max disp %7.3f m | round trip %.1e m\n",
+                k, nrow(jobs), job$sample_name, job$tilt_mag,
+                out$summary$disp_max, out$summary$rt))
+  }
+
+  rm(las_ref, box_xyz_1, pivot_base, bx, by, bz)
+  invisible(gc(verbose = FALSE))
+}
+
+results <- Filter(Negate(is.null), results)
+cat(sprintf("\n%d of %d job(s) generated in %.1f min\n",
+            length(results), nrow(jobs),
+            as.numeric(difftime(Sys.time(), t_start, units = "mins"))))
+rm(.d)
+```
+
+## T.10 The Consolidated Reference CSV
+
+One row per sample, every reference file and every tilt in the run, in a single
+file. This is the one to hand the batch driver as `truth_csv_path`.
+
+```{r}
+#| label: export-consolidated
+#| code-summary: "The stacked truth table, and a ready-made las_pairs for the driver"
+
+if (!length(results))
+  stop("No samples were generated - there is nothing to consolidate. See the failure table.")
+
+# bind_rows rather than rbind: it fills a missing column with NA instead of
+# refusing, which matters the day a column is added and a half-finished output
+# directory holds rows from both versions.
+truth_all <- dplyr::bind_rows(results)
+
+# Written with .unique_path OFF regardless of overwrite_existing: a consolidated
+# file that parked itself at _1 would leave the previous run's file sitting
+# there under the name everything else points at, which is the one failure mode
+# worth ruling out by construction.
+utils::write.csv(truth_all, consolidated_truth_csv, row.names = FALSE)
+cat(sprintf("Reference CSV: %d row(s) x %d column(s) -> %s\n",
+            nrow(truth_all), ncol(truth_all), consolidated_truth_csv))
+
+# No separate las_pairs file. Everything the driver needs to build one is
+# already in the table above - sample_las is las_1, and the ID fields name
+# las_2 - so a second file would be a copy that can fall out of step with it.
+
+# Every sample_name must appear exactly once, because that column is what every
+# downstream join keys on. The job table was already checked for duplicates, so
+# reaching here means something changed between then and now.
+if (anyDuplicated(truth_all$sample_name))
+  stop("The consolidated table has duplicate sample_name values: ",
+       paste(unique(truth_all$sample_name[duplicated(truth_all$sample_name)]), collapse = ", "))
+
+cat(sprintf("  covering %d reference file(s) x %d tilt(s), %d sample(s) in total\n",
+            length(unique(truth_all$reference_las_1)),
+            length(unique(truth_all$applied_rot_xy_mag_deg)),
+            nrow(truth_all)))
+
+if (length(failures)) {
+  fail_df <- dplyr::bind_rows(failures)
+  cat(sprintf("\n%d job(s) FAILED and were not written:\n", nrow(fail_df)))
+  for (i in seq_len(nrow(fail_df)))
+    cat(sprintf("  %-46s %s\n", fail_df$sample_name[i], fail_df$error[i]))
+} else {
+  cat("\nNo failures.\n")
+}
+
+# ── What the sweep looks like ────────────────────────────────────────────────
+# The shift is constant, so target_shift_* is identical down every row - that is
+# the control. What varies is the tilt, and with it how far the marker box
+# corners had to travel. A corner displacement that does not grow with the tilt
+# would mean the tilt is not reaching the geometry.
+cat("\n── The sweep ─────────────────────────────────────────────────────────────\n")
+print(truth_all[, c("sample_name", "applied_rot_xy_mag_deg", "applied_rot_total_deg",
+                    "target_rot_xy_mag_deg", "box_corner_disp_max_m",
+                    "check_roundtrip_max_m")],
+      row.names = FALSE, digits = 5)
+```
+
+### Vis - reference, generated sample, and the markers
+
+Drawn for `detail_job` only. Twenty-eight interactive 3D plots in one HTML
+document is a file nobody can open.
+
+```{r}
+#| label: fig-generated-sample
+#| fig-cap: "The reference cloud and one generated sample, with the rotation pivot and both marker boxes."
+
+if (params$make_plots && !is.null(detail)) {
+
+  vis_max_pts <- 20000L
+  job_d <- jobs[detail_job, ]
+
+  .thin <- function(m, lab) {
+    n <- nrow(m)
+    i <- if (n > vis_max_pts) sample.int(n, vis_max_pts) else seq_len(n)
+    data.frame(X = m[i, 1], Y = m[i, 2], Z = m[i, 3], cloud = lab)
+  }
+
+  set.seed(7L)
+  .df <- rbind(
+    .thin(detail$xyz_base,  "reference (aligned)"),
+    .thin(detail$xyz_final, "generated sample (misaligned)")
+  )
+
+  # Plotted about the pivot, so the axes read as metres of displacement rather
+  # than as UTM coordinates where a 20 cm shift is invisible in the last digits.
+  .df$Xl <- .df$X - detail$pivot_base[1]
+  .df$Yl <- .df$Y - detail$pivot_base[2]
+
+  plot_ly() |>
+    add_markers(data = .df, x = ~Xl, y = ~Yl, z = ~Z, color = ~cloud,
+                colors = c("reference (aligned)"           = COL_1,
+                           "generated sample (misaligned)" = COL_P),
+                marker = list(size = 1.5, opacity = 0.5),
+                hoverinfo = "text", text = ~cloud) |>
+    add_markers(x = detail$pivot_shifted[1] - detail$pivot_base[1],
+                y = detail$pivot_shifted[2] - detail$pivot_base[2],
+                z = detail$pivot_shifted[3],
+                marker = list(size = 8, color = "black", symbol = "x"),
+                name = "pivot (shifted)") |>
+    add_markers(x = detail$box_xyz_1[, 1] - detail$pivot_base[1],
+                y = detail$box_xyz_1[, 2] - detail$pivot_base[2],
+                z = detail$box_xyz_1[, 3],
+                marker = list(size = 6, color = COL_2, symbol = "diamond"),
+                text = paste0("TargetBox 1 (truth), corner ", 1:8),
+                hoverinfo = "text", name = "marker box 1 (truth)") |>
+    add_markers(x = detail$box_xyz_2[, 1] - detail$pivot_base[1],
+                y = detail$box_xyz_2[, 2] - detail$pivot_base[2],
+                z = detail$box_xyz_2[, 3],
+                marker = list(size = 6, color = COL_1, symbol = "diamond-open"),
+                text = paste0("TargetBox 2 (moved), corner ", 1:8),
+                hoverinfo = "text", name = "marker box 2 (moved)") |>
+    layout(title = sprintf("%s - shift %.3f m, tilt %.3f deg, full rotation %.4f deg",
+                           job_d$sample_name,
+                           sqrt(tg_shift_x^2 + tg_shift_y^2 + tg_shift_z^2),
+                           job_d$tilt_mag, detail$rot_total),
+           scene = list(xaxis = list(title = "X - pivot (m)"),
+                        yaxis = list(title = "Y - pivot (m)"),
+                        zaxis = list(title = "Z (m)"),
+                        aspectmode = "data"))
+}
+```
+
+Generation complete
+
+Each `.las` in `las_output_dir` is now an ordinary-looking unaligned sample.
+Point the batch driver's `truth_csv_path` at the consolidated CSV and list the
+sample names you want in `sample_names` - the driver resolves `las_1_path` and
+`las_2_path` from that table itself - then run the pipeline through
+to Stage 6 exactly as normal - nothing downstream is told these are tests. Stage
+6 Step 6.6 finds each sample's row by `sample_name`, applies the transform it
+solved to the `TargetBox = 2` corners, and reports the gap to their
+`TargetBox = 1` twins as the primary shift residual.
+
+Because the shift and the yaw are held constant across the sweep and only the
+tilt varies, a plot of Stage 6's `box_res_xyz_m` against
+`applied_rot_xy_mag_deg` reads directly as how far the tilt can be pushed before
+the pipeline stops recovering it.
+
+Stage 1 from `Stage1_2026-08-19_1.qmd` onward drops the sixteen `TargetBox`
+points at load, so the marker box no longer reaches `pivot1_auto` or the Stage 1A
+sideways-forest test. On an older Stage 1, use `pivot1_mode = "las"` and be aware
+that the box-2 corners - which at a 180 degree tilt sit a long way outside the
+forest - are still inflating the cloud extent.

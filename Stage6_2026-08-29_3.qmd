@@ -1,0 +1,1848 @@
+---
+title: "Forest Point Cloud Alignment – Stage 6"
+subtitle: "Compose the solved transforms and export the aligned point cloud"
+author: "Point Cloud Analysis"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    theme: flatly
+    highlight-style: github
+    fig-width: 9
+    fig-height: 6
+    self-contained: true
+execute:
+  warning: false
+  message: false
+  eval: false
+params:
+  make_plots: true
+---
+
+
+# Overview – Stage 6 of 6
+
+Every earlier stage solved a transform and wrote it down. **Stage 6 is the only
+stage that applies the whole thing to the point cloud**, in a single pass, and
+writes the result to disk.
+
+The composed transform
+
+$$p' = T_z\big(R_{\text{align+xyz}}\, p + t_{\text{align+xyz}}\big) + t$$
+
+where
+
+- $R_{\text{align+xyz}},\ t_{\text{align+xyz}}$ – the **composed** raw -> final
+  map recorded at the end of Stage 2 (`R_align_xyz_1` / `t_align_xyz_1`): the
+  Stage 1A rough vertical alignment followed by the fine 3D rotation `R_xyz`,
+  both about `pivot1`,
+- $T_z$ – the Z-only rotation solved in Stage 4, about `pivot1` in XY, rebuilt
+  here from the stored `z_rotation_deg` using the identical sign convention
+  Stage 5 used,
+- $t$ – the XYZ translation: `t_trans_xy` from Stage 5 in X and Y,
+  `t_trans_z_applied` from Stage 4 in Z.
+
+Why the ROUGH alignment has to be in there
+
+`las_1` sits on disk in the original scan frame. Stage 1A verticalised it **in
+memory only** – there is no `writeLAS` anywhere in Stage 1 – and every
+measurement made after that point, `pivot1` and `R_xyz` included, lives in the
+aligned frame. So `R_xyz` on its own is a rotation solved for a cloud this stage
+never reads. Stage 2 already composed the two legs into `R_align_xyz_1`, and
+that is what Step 6.2 applies.
+
+One pivot, so no rotation produces a shift
+
+Stage 1A fixes `pivot1` **before** it rotates and does not recompute it
+afterwards, so the rough alignment and the fine `R_xyz` turn about the same
+point and their composition is a pure rotation about it. Stage 4 then shifted
+the frame vertically and moved the pivot to `pivot2`, and Stage 5 rotated about
+that – but `pivot2` differs from `pivot1` only in Z, and a rotation about the
+vertical axis is unaffected by a vertical offset of its pivot. `pivot2` sits in
+the same place relative to the cloud after the Z-shift as `pivot1` did before
+it, so the Z-only leg can be built about `pivot1` and reproduce the staged
+result exactly.
+
+The consequence, and the reason it is worth stating: **there is one set of shift
+figures, `t_exp`, and nothing else in this stage is a shift.** The translation
+columns inside `M_export` are pivot-recentring terms – in UTM coordinates they
+run to hundreds of metres for a fraction of a degree – and quoting them as a
+"net translation" would be reporting the pivot's coordinates back as though they
+were a measurement. Steps 6.2 and the summary each assert that re-expressing the
+transform about `pivot1` returns `t_exp` unchanged; if either ever fails, some
+leg has acquired a pivot of its own.
+
+Diagnostic toggles
+
+Each transform component can be switched off independently
+(`apply_xyz_rotation`, `apply_z_rotation`, `apply_xy_translation`,
+`apply_z_translation`). Exporting with a single component enabled is the
+quickest way to attribute a residual misalignment to a particular stage.
+
+Export completeness
+
+The export is deliberately **not** restricted to paired or kept trees. Every
+point of the source cloud is written, including points whose `TreeID` is `0` or
+`NA` (ground, understorey, unsegmented returns). The alignment was *derived*
+from a subset of stems; it is *applied* to everything.
+
+# Stage 0 - Setup
+
+
+## 0.1 Load libraries
+```{r}
+#| label: setup
+#| code-summary: "Load libraries and set plot theme"
+
+library(lidR)       # LAS I/O and point cloud processing
+library(ggplot2)    # Plotting
+library(dplyr)      # Data wrangling
+library(plotly)     # Interactive 3D overlay figure
+library(base64enc)  # Embed rendered plots into HTML galleries
+library(htmltools)  # Assemble the HTML gallery output
+
+# ── Driver-supplied parameter overrides ──────────────────────────────────────
+# Every params-* chunk in this file ends with .par_apply("<its label>"). Run the
+# file by hand and that call does nothing: the values the chunk just assigned
+# stand. Run it under the batch driver, which puts a .batch_params list in the
+# environment before the first chunk, and any entry keyed to that chunk label is
+# assigned here - AFTER the defaults, so the driver's value is the one that
+# survives into the functional chunk that follows.
+#
+# Why this exists. Parameters used to sit in the same chunk as the code that
+# consumed them, so the driver's overrides - which land after a chunk finishes -
+# arrived too late to matter, and every pair silently used the .qmd's hardcoded
+# value. Splitting each chunk in two fixes the ordering; this helper is what the
+# driver reaches through.
+#
+# The defaults stay in this file rather than moving into the driver. They are
+# the single definition, the driver names only what a batch changes, and there
+# is no second copy of ~670 parameters to drift out of step with this one.
+#
+# envir = parent.frame() so a call at chunk top level lands in the environment
+# the chunk is being evaluated in - globalenv by hand, the pair environment
+# under the driver - without needing .stage_env(), which is defined further down.
+.par_apply <- function(label, envir = parent.frame()) {
+  bp <- mget(".batch_params", envir = envir, ifnotfound = list(NULL),
+             inherits = TRUE)[[1]]
+  if (is.null(bp) || is.null(bp[[label]])) return(invisible(character(0)))
+  vals <- bp[[label]]
+  if (!length(vals)) return(invisible(character(0)))
+  if (is.null(names(vals)) || any(!nzchar(names(vals))))
+    stop(sprintf("[.par_apply] .batch_params[['%s']] must be a fully NAMED list.", label))
+  # A name the chunk did not define is almost always a typo or a rename in the
+  # .qmd that the driver has not caught up with. Silence there would mean the
+  # batch runs on the default while looking like it was overridden, so it stops.
+  unknown <- names(vals)[!vapply(names(vals), exists, logical(1),
+                                 envir = envir, inherits = FALSE)]
+  if (length(unknown))
+    stop(sprintf(paste0("[.par_apply] %s: %d override(s) name nothing this chunk assigns:\n  %s\n",
+                        "  Fix the name in the driver's .build_params(), or remove it."),
+                 label, length(unknown), paste(unknown, collapse = "\n  ")))
+  for (nm in names(vals)) assign(nm, vals[[nm]], envir = envir)
+  cat(sprintf("  [params] %s <- driver (%s)\n", label, paste(names(vals), collapse = ", ")))
+  invisible(names(vals))
+}
+```
+
+## 0.2 Global Helpers
+```{r}
+#| label: params-helpers
+#| code-summary: "Parameters - Colours, ggplot theme, stage save/load utilities, and the rotation/shift description helpers"
+
+# ============================================================
+# Colours
+# ============================================================
+COL_1     <- "#2196F3"
+COL_2     <- "#FF5722"
+COL_MATCH <- "#D9F9A5"
+
+.par_apply("params-helpers")
+```
+
+```{r}
+#| label: helpers
+#| code-summary: "Colours, ggplot theme, stage save/load utilities, and the rotation/shift description helpers"
+
+# ============================================================
+# ggplot theme
+# ============================================================
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title       = element_text(face = "bold"),
+      legend.position  = "bottom"
+    )
+)
+
+# ============================================================
+# Stage save/load utilities – shared by every stage file.
+#
+# Contract (identical in all six stage files):
+# SAVE → hard ERROR if any *required* object is missing from the
+# environment, so a checkpoint can never be written half-empty.
+# A *warning* is raised for any missing *optional* object
+# (diagnostic products that may legitimately not have been run);
+# those are simply omitted from the file.
+# LOAD → never errors on content. A *warning* is raised for each
+# requested object that is absent from the RDS. Objects present in
+# the RDS but not requested are COUNTED in the summary line and
+# never listed. Everything found in the file is loaded either way,
+# so nothing is silently discarded.
+# PATHS → a save never overwrites: if the target path exists, a numeric
+# suffix (_001, _002, ...) is appended until the name is free.
+# ============================================================
+
+#' Return `path` if free, otherwise path_001 / path_002 / ... (first free one).
+.unique_path <- function(path) {
+  if (!file.exists(path)) return(path)
+  base_noext <- tools::file_path_sans_ext(path)
+  ext        <- tools::file_ext(path)
+  counter    <- 1L
+  repeat {
+    candidate <- sprintf("%s_%03d.%s", base_noext, counter, ext)
+    if (!file.exists(candidate)) {
+      cat(sprintf("Target already exists - using unique name: %s\n", candidate))
+      return(candidate)
+    }
+    counter <- counter + 1L
+  }
+}
+
+#' Which environment do the stage helpers read and write?
+#'
+#' A .qmd rendered or run by hand evaluates its chunks in the global
+#' environment. The batch driver does not: it gives every LAS pair a fresh
+#' environment of its own, so that a leftover object from the previous pair
+#' cannot be picked up by one of the exists() guards this pipeline is full of.
+#' Under the driver, everything the stages assign therefore lives THERE, and
+#' not in globalenv.
+#'
+#' parent.env(environment()) is the environment this chunk was evaluated in:
+#' globalenv() by hand, the pair environment under the driver. It is resolved
+#' from where .stage_env was DEFINED rather than from where it is called, so it
+#' returns the same environment inside a function as it does at chunk top
+#' level, and nothing has to be told which mode it is in.
+#'
+#' This replaced a hardcoded .stage_env() throughout. Under the driver that
+#' pointed at an environment the pipeline had never written to, so every object
+#' in a save manifest read as missing and the checkpoint refused to write - the
+#' Stage 1 failure that reported 30 missing required objects after a 64-minute
+#' fit. (`run_counts` was the one it did find, and only because .tally()'s `<<-`
+#' walked past the pair environment into globalenv. That is fixed below too.)
+.stage_env <- function() parent.env(environment())
+
+#' Is a batch driver running this file?
+#'
+#' The driver assigns .batch_mode <- TRUE into the pair environment before the
+#' first chunk runs. It changes one thing, and only for the checkpoints: in a
+#' batch, every stage runs in ONE session, so Stage N+1 already holds in memory
+#' everything Stage N computed and never has to read it back off disk. The
+#' checkpoints stop being load-bearing and become a record of the run.
+#'
+#' So under a batch: nothing in a manifest is required (a missing object is
+#' reported and left out, and the pair carries on), a failed write is reported
+#' rather than thrown, and .stage_load is a no-op. Run the same .qmd by hand and
+#' every one of those is an error again, which is what it should be when the
+#' checkpoint is the only thing carrying the stage forward.
+.in_batch <- function() {
+  isTRUE(mget(".batch_mode", envir = .stage_env(),
+              ifnotfound = list(FALSE), inherits = FALSE)[[1]])
+}
+
+#' Read one of the driver's batch settings out of the pair environment.
+#' Absent - i.e. this file is being run by hand - gives `default`.
+.batch_opt <- function(name, default = NULL) {
+  v <- mget(name, envir = .stage_env(), ifnotfound = list(NULL), inherits = FALSE)[[1]]
+  if (is.null(v)) default else v
+}
+
+#' Where a checkpoint goes when a batch is running.
+#'
+#' Every save chunk in this pipeline assigns its .rds path and then USES it a
+#' few lines later, in the same chunk. The driver applies its overrides AFTER a
+#' chunk has run, so an override of stage1_rds_path arrives after the file has
+#' already been written to the path hardcoded here - which means, without this,
+#' every sample in a batch writes over the same hardcoded name.
+#'
+#' So in batch mode the destination is derived instead, from two values the
+#' driver puts in the environment before anything runs: .batch_rds_dir and
+#' .batch_sample. The label the save chunk already passes supplies the rest, so
+#' "Stage 3.2" becomes <dir>/<sample>_Stage3_2.rds with nothing to keep in sync.
+#'
+#' NULL means: not in a batch, or the driver did not set the directory - use the
+#' path the chunk asked for.
+.batch_rds_path <- function(label) {
+  dir <- .batch_opt(".batch_rds_dir")
+  smp <- .batch_opt(".batch_sample")
+  if (is.null(dir) || is.null(smp)) return(NULL)
+  file.path(dir, sprintf("%s_%s.rds", smp,
+                         gsub("\\.", "_", gsub("\\s+", "", label))))
+}
+
+#' Save a stage checkpoint. Errors on missing required objects - unless the
+#' batch driver is running this file, in which case nothing is required, the
+#' destination is the per-sample one derived above, and a failure to write is
+#' reported rather than thrown. See .in_batch() above.
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+.stage_save <- function(path, required, optional = character(0),
+                        label = "stage", envir = .stage_env(),
+                        strict = !.in_batch()) {
+
+  required <- unique(required)
+  optional <- setdiff(unique(optional), required)
+
+  # A batch may switch an individual checkpoint off by label - the driver's
+  # keep_stage3_fit_checkpoint does exactly this for "Stage 3.1", whose chunk
+  # must still RUN (the final Stage 3 manifest inherits from it) but need not
+  # write a second large file per sample.
+  if (!strict && label %in% .batch_opt(".batch_skip_saves", character(0))) {
+    cat(sprintf("[%s save] Skipped - switched off for this batch.\n", label))
+    return(invisible(NA_character_))
+  }
+
+  # inherits = FALSE, matching the mget() below, which has always been strict.
+  # With inheritance on, an object could be FOUND in a parent environment and
+  # then fail to be FETCHED, and under the driver the parent is globalenv -
+  # i.e. the previous pair's leftovers.
+  .have <- function(x)
+    if (!length(x)) logical(0)
+    else vapply(x, exists, logical(1), envir = envir, inherits = FALSE)
+
+  missing_req <- required[!.have(required)]
+  if (length(missing_req) > 0L) {
+    if (strict)
+      stop(sprintf(
+        "[%s save] Cannot save - %d required object(s) missing from the environment:\n  %s",
+        label, length(missing_req), paste(missing_req, collapse = "\n  ")))
+    cat(sprintf(
+      "[%s save] %d required object(s) missing - treated as optional and omitted (batch mode):\n  %s\n",
+      label, length(missing_req), paste(missing_req, collapse = "\n  ")))
+  }
+
+  missing_opt <- optional[!.have(optional)]
+  if (length(missing_opt) > 0L) {
+    msg <- sprintf(
+      "[%s save] %d optional object(s) missing - omitted from the checkpoint:\n  %s",
+      label, length(missing_opt), paste(missing_opt, collapse = "\n  "))
+    if (strict) warning(msg) else cat(msg, "\n", sep = "")
+  }
+
+  present  <- c(setdiff(required, missing_req), setdiff(optional, missing_opt))
+  n_opt_in <- length(setdiff(optional, missing_opt))
+  dat      <- mget(present, envir = envir, inherits = FALSE)
+
+  # ── The checkpoint describes itself ────────────────────────────────────────
+  # The manifest travels INSIDE the file. Without it, loading a checkpoint means
+  # first reconstructing the exact `required`/`optional` vectors it was written
+  # with - and those are built by chunks, so a later checkpoint could only be
+  # loaded after running the chunks that define an earlier one's manifest. That
+  # made resuming from an arbitrary point in a fresh session impossible: the
+  # Stage 3.2 chunk, for instance, stops outright unless .stage3_1_required is
+  # already in scope.
+  #
+  # Stored under a name no manifest can collide with, and stripped again on
+  # load, so it never reaches the session as an object.
+  dat[[".__manifest__"]] <- list(
+    required = setdiff(required, missing_req),
+    optional = setdiff(optional, missing_opt),
+    label    = label,
+    saved_utc = format(Sys.time(), tz = "UTC", usetz = TRUE))
+
+  .write <- function() {
+    p <- path
+    if (!strict) {
+      bp <- .batch_rds_path(label)
+      if (!is.null(bp)) p <- bp
+    }
+    dir.create(dirname(p), recursive = TRUE, showWarnings = FALSE)
+    # .unique_path only interactively. A batch path already carries the sample
+    # name, so it cannot collide with another sample, and a re-run of the same
+    # sample should REPLACE its checkpoint rather than leave _001, _002 behind
+    # for the next reader to guess between.
+    if (strict) p <- .unique_path(p)
+    saveRDS(dat, p)
+    cat(sprintf("[%s save] Saved %d object(s) (%d required, %d optional) -> %s\n",
+                label, length(dat), length(present) - n_opt_in, n_opt_in, p))
+    p
+  }
+
+  if (strict) return(invisible(.write()))
+
+  out <- tryCatch(.write(), error = function(e) {
+    cat(sprintf("[%s save] Checkpoint NOT written: %s\n", label, conditionMessage(e)))
+    cat(sprintf("[%s save] Batch mode - the objects are still in this session, so the run continues.\n",
+                label))
+    NA_character_
+  })
+  invisible(out)
+}
+
+#' Load a stage checkpoint. Warns (never errors) on content mismatches, and
+#' under the batch driver does not read at all - see .in_batch() above.
+.stage_load <- function(path, required, optional = character(0),
+                        label = "stage", envir = .stage_env(),
+                        strict = !.in_batch()) {
+
+  # In a batch the objects this would read are already live in `envir`, put
+  # there by the stage that just ran. Reading them back would at best be a
+  # no-op. At worst it would be wrong: checkpoint paths are per-sample and
+  # .unique_path() means a re-run writes _001 rather than replacing the
+  # original, so the path named here can easily be an EARLIER run's file. And
+  # if the write failed or was partial, there would be nothing to read and the
+  # pair would die at the start of the next stage having done all the work.
+  if (!strict) {
+    cat(sprintf("[%s load] Skipped - batch mode: this stage's objects are already in the session.\n",
+                label))
+    return(invisible(character(0)))
+  }
+
+  if (!file.exists(path))
+    stop(sprintf("[%s load] File not found:\n  %s", label, path))
+
+  dat <- readRDS(path)
+
+  # ── Prefer the manifest the file carries ───────────────────────────────────
+  # A checkpoint written by .stage_save records what it holds, so a load needs
+  # nothing from the session - no earlier chunk, no earlier checkpoint, no
+  # reconstructed name vectors. `required` and `optional` become a CHECK against
+  # what the caller expected rather than the definition of what to read, which
+  # is what lets any stage be resumed from any checkpoint in a fresh session.
+  #
+  # Files written before manifests existed simply have none; those fall back to
+  # the caller's vectors, exactly as before.
+  mf <- dat[[".__manifest__"]]
+  dat[[".__manifest__"]] <- NULL
+  caller_req <- unique(required)
+  caller_opt <- setdiff(unique(optional), caller_req)
+
+  if (!is.null(mf)) {
+    required <- unique(mf$required)
+    optional <- setdiff(unique(mf$optional), required)
+    src <- sprintf("its own manifest (written %s)", mf$saved_utc %||% "?")
+  } else {
+    required <- caller_req; optional <- caller_opt
+    src <- "the caller's manifest - this file predates self-describing checkpoints"
+  }
+  expected <- c(required, optional)
+
+  cat(sprintf("[%s load] Reading %d object(s) from: %s\n",
+              label, length(dat), path))
+  cat(sprintf("[%s load] Manifest: %s\n", label, src))
+
+  # Named by the caller but absent from the file: the real incompatibility, and
+  # the only one worth a warning when the file describes itself.
+  if (!is.null(mf)) {
+    unmet <- setdiff(caller_req, names(dat))
+    if (length(unmet))
+      warning(sprintf(
+        "[%s load] %d object(s) this stage expects are not in the checkpoint:\n  %s",
+        label, length(unmet), paste(unmet, collapse = "\n  ")))
+  }
+
+  missing_req <- required[!required %in% names(dat)]
+  if (length(missing_req) > 0L)
+    warning(sprintf(
+      "[%s load] %d REQUIRED object(s) absent from the RDS - downstream chunks that use them will fail:\n  %s",
+      label, length(missing_req), paste(missing_req, collapse = "\n  ")))
+
+  missing_opt <- optional[!optional %in% names(dat)]
+  if (length(missing_opt) > 0L)
+    warning(sprintf(
+      "[%s load] %d optional object(s) absent from the RDS:\n  %s",
+      label, length(missing_opt), paste(missing_opt, collapse = "\n  ")))
+
+  # Unrequested objects are COUNTED, never listed. Every checkpoint from Stage 2
+  # onward is cumulative, so this set is routinely hundreds of names long and
+  # printing it buried the two messages that actually matter - an absent
+  # required object, and an absent optional one - under a wall of text. The
+  # count still appears in the summary line below, which is the only part of it
+  # anyone reads.
+  extra <- setdiff(names(dat), expected)
+
+  # ── Publish what was loaded, for the next stage's save manifest ────────────
+  # Every stage's SAVE manifest is built as "the previous stage's manifest, plus
+  # my own objects", and the previous manifest is a vector defined by that
+  # stage's LOAD chunk. Load a LATER checkpoint directly and that chunk never
+  # runs, so the save dies on a missing .stageN_required - which is exactly the
+  # resume-from-anywhere case these checkpoints now exist to support.
+  #
+  # Recording the manifest here breaks the dependency: .manifest_from() below
+  # falls back to whatever was actually loaded, whichever chunk did it.
+  assign(".stage_last_manifest",
+         list(required = required, optional = optional,
+              names = names(dat), label = label, path = path),
+         envir = envir)
+
+  list2env(dat, envir = envir)
+
+  cat(sprintf("[%s load] Loaded %d object(s) | required present: %d/%d | optional present: %d/%d | unrequested: %d\n",
+              label, length(dat),
+              length(required) - length(missing_req), length(required),
+              length(optional) - length(missing_opt), length(optional),
+              length(extra)))
+  invisible(names(dat))
+}
+
+#' The manifest a save chunk inherits from the stage before it.
+#'
+#' Looks for the named vector first - that is the normal path, when this
+#' session's own load chunk built it. Falls back to the manifest carried by
+#' whichever checkpoint was last loaded, which is what makes it possible to load
+#' any checkpoint and still save the next one.
+#'
+#' `which` is "required" or "optional". Stops with something actionable rather
+#' than returning character(0): a save that silently inherits nothing writes a
+#' checkpoint missing every object from every earlier stage, and nothing would
+#' notice until a later stage failed to find them.
+.manifest_from <- function(name, which = c("required", "optional"),
+                           envir = .stage_env()) {
+  which <- match.arg(which)
+  if (exists(name, envir = envir, inherits = FALSE))
+    return(get(name, envir = envir, inherits = FALSE))
+
+  lm <- if (exists(".stage_last_manifest", envir = envir, inherits = FALSE))
+          get(".stage_last_manifest", envir = envir, inherits = FALSE) else NULL
+
+  if (!is.null(lm)) {
+    cat(sprintf("[manifest] %s not in the session - inheriting from the %s checkpoint that was loaded.\n",
+                name, lm$label))
+    # For "required", everything the loaded file actually held is the honest
+    # inheritance: it is what this session has, regardless of how the file that
+    # produced it split required from optional.
+    return(if (identical(which, "required")) lm$names else character(0))
+  }
+
+  # ── Last resort: the session itself ────────────────────────────────────────
+  # No named vector and no checkpoint loaded. That is the ordinary case for a
+  # session built by RUNNING chunks rather than by loading - Stage 1 through
+  # Stage 3 straight down the document, or an interactive session where the
+  # objects were produced rather than read. There is nothing wrong with it, and
+  # a save must not refuse.
+  #
+  # So fall back to what Stages 4 and 5 have always done: take the manifest from
+  # the environment. Every non-function, non-dotted object in scope is what this
+  # stage inherited, by definition - it is the same rule, just applied later.
+  #
+  # Only "required" gets this. Optional means "save it if it happens to exist",
+  # which is meaningless once the list IS everything that exists.
+  if (identical(which, "required")) {
+    nm <- setdiff(ls(envir = envir), lsf.str(envir = envir))
+    nm <- nm[!startsWith(nm, ".")]
+    if (length(nm)) {
+      cat(sprintf(paste0("[manifest] %s not found and no checkpoint was loaded - taking the manifest\n",
+                         "           from the session instead (%d object(s)). This is the normal path\n",
+                         "           when the stage was RUN rather than loaded.\n"), name, length(nm)))
+      return(nm)
+    }
+  } else {
+    return(character(0))
+  }
+
+  stop(sprintf(paste0("[manifest] %s not found, no checkpoint has been loaded, and the session is\n",
+                      "  empty - there is nothing to save. Run this stage's chunks, or load a\n",
+                      "  checkpoint, before the save chunk."), name))
+}
+
+#' Print the Stage 1 pivot point.
+.report_pivot1 <- function() {
+  if (exists("pivot1")) {
+    cat(sprintf("pivot1 (Stage 1 footprint centre): (%.4f, %.4f, %.4f)\n",
+                pivot1[1], pivot1[2], pivot1[3]))
+  } else {
+    cat("pivot1 NOT available.\n")
+  }
+}
+
+# ============================================================
+# Rotation description: one factorisation, used everywhere
+#
+# A 3x3 rotation is not readable. Every summary and every error term in this
+# stage is quoted as four numbers instead:
+#
+#   XY rotation magnitude - tilt away from vertical, degrees
+#   XY rotation direction - azimuth the +Z AXIS tips toward, CCW from +X, [0,360)
+#   Z rotation            - yaw about vertical, CCW seen from above, degrees
+#   full XYZ rotation     - the total turn about the matrix's own axis
+#
+# The first three are an EXACT factorisation, not a description:
+#     R = tilt(mag, dir) %*% yaw(z)
+# so the three numbers rebuild R to machine precision and .decompose_rotation()
+# returns that residual as rebuild_err. That distinction matters for an error
+# report - a set of angles that merely characterises a residual rotation is not
+# something anyone can act on or re-apply.
+#
+# The tilt builder is byte-identical to Stage 3's .tilt_rotation_matrix and to
+# the one in the test-sample generator. All three must agree: if this stage
+# described a rotation in a different convention from the one that generated the
+# truth values, the errors below would be measuring the gap between two
+# conventions rather than the pipeline's accuracy. Edit one, edit all three.
+#
+# Convention, verified against the matrix rather than asserted:
+#     tilt(m, d) %*% c(0, 0, 1) = (sin m cos d, sin m sin d, cos m)
+# so m is exactly the tilt and d is exactly the azimuth the +Z axis leans toward.
+# (Points on the ground at azimuth d move DOWN, not up - the axis tips that way.)
+# ============================================================
+.tilt_rotation_matrix <- function(magnitude_deg, direction_deg) {
+  m <- magnitude_deg * pi / 180
+  d <- direction_deg * pi / 180
+  axis <- c(-sin(d), cos(d), 0)          # horizontal axis, perpendicular to direction
+  ax <- axis[1]; ay <- axis[2]; az <- axis[3]
+  K <- matrix(c(  0, -az,  ay,
+                 az,   0, -ax,
+                -ay,  ax,   0), nrow = 3, byrow = TRUE)
+  diag(3) + sin(m) * K + (1 - cos(m)) * (K %*% K)
+}
+
+.yaw_rotation_matrix <- function(deg) {
+  a <- deg * pi / 180
+  R <- diag(3)
+  R[1:2, 1:2] <- matrix(c(cos(a), -sin(a),
+                          sin(a),  cos(a)), nrow = 2, byrow = TRUE)
+  R
+}
+
+.compose_rotation <- function(xy_mag_deg, xy_dir_deg, z_deg) {
+  .tilt_rotation_matrix(xy_mag_deg, xy_dir_deg) %*% .yaw_rotation_matrix(z_deg)
+}
+
+#' Exact inverse of .compose_rotation. Returns tilt magnitude, tilt direction,
+#' yaw and total angle, plus the residual of rebuilding R from the three.
+#' At zero tilt the direction is undefined and returned as NA rather than as the
+#' 0 that atan2(0, 0) happens to give - "no tilt" and "tilt pointing due east"
+#' are different claims and only one of them is true.
+.decompose_rotation <- function(R, dir_tol_deg = 1e-9) {
+  m <- acos(max(-1, min(1, R[3, 3]))) * 180 / pi
+  d <- if (m < dir_tol_deg) NA_real_ else (atan2(R[2, 3], R[1, 3]) * 180 / pi) %% 360
+  M <- t(.tilt_rotation_matrix(m, if (is.na(d)) 0 else d)) %*% R
+  a <- atan2(M[2, 1], M[1, 1]) * 180 / pi
+  list(xy_mag_deg  = m,
+       xy_dir_deg  = d,
+       z_deg       = a,
+       total_deg   = acos(max(-1, min(1, (sum(diag(R)) - 1) / 2))) * 180 / pi,
+       rebuild_err = max(abs(.compose_rotation(m, if (is.na(d)) 0 else d, a) - R)))
+}
+
+#' Break a translation into the five numbers the summaries and the error report
+#' both quote: the three components, the horizontal magnitude, and the full 3-D
+#' magnitude.
+.shift_specs <- function(t) {
+  t <- as.numeric(t)
+  list(x = t[1], y = t[2], z = t[3],
+       xy = sqrt(sum(t[1:2]^2)), xyz = sqrt(sum(t^2)))
+}
+
+#' The translation a full affine map applies AT a chosen reference point - i.e.
+#' rewriting "R x + t_col" as "rotate about P, then shift by s".
+#'
+#' Needed because a shift is only meaningful relative to a pivot once a rotation
+#' is involved. The raw translation column of a world-coordinate 4x4 is dominated
+#' by the pivot-recentring terms (these are UTM coordinates, so it runs to
+#' hundreds of metres for a fraction of a degree) and comparing two of those
+#' tells you nothing. Referred to a pivot, the same matrix reports the metres of
+#' shift a reader would recognise.
+.shift_about <- function(M, P) {
+  P <- as.numeric(P)
+  as.numeric(M[1:3, 4] - P + M[1:3, 1:3] %*% P)
+}
+```
+
+## 0.3 Load the Stage 5 Checkpoint
+
+Stage 6 asks for only the handful of objects it actually needs: the file paths,
+the pivots, and the solved transform
+components. Everything else in the checkpoint is loaded too (nothing is
+discarded) but is only counted, not listed.
+
+```{r}
+#| label: params-load_Stage6
+#| code-summary: "Parameters - Load the Stage 5 checkpoint and report the pivots and the solved transform components"
+
+
+stage5_rds_path <- "C:/Users/ascsh/Documents/1_Artemis/11_PaqLab/115_TreeTimeAlign/RunR/exports/SaveLoad/I_SNBG_F1_ai_134p77_2020_2024_TLS_TLS_Stage5.rds"
+
+.par_apply("params-load_Stage6")
+```
+
+```{r}
+#| label: load_Stage6
+#| code-summary: "Load the Stage 5 checkpoint and report the pivots and the solved transform components"
+#| code-fold: false
+
+# Stage 6 uses only a handful of Stage 5 objects. .stage_load pulls EVERYTHING in
+# the RDS via list2env regardless of this list (the manifest only drives the
+# present/absent warnings), so Stage 6 requests just what the compose-and-apply
+# needs and lets the loader bring the rest in silently; the loader counts the
+# unrequested objects rather than listing them.
+.stage6_required <- c(
+  # file paths (to re-load the cloud)
+  "las_1_path", "las_2_path",
+  # rotation origin(s)
+  "pivot1", "pivot2",
+  # Stage 2: the COMPOSED raw->final rotation (Stage 1A rough align + R_xyz).
+  # This, not R_xyz alone, is what a raw on-disk las_1 has to be put through -
+  # see the note in Step 6.2.
+  "R_align_xyz_1", "t_align_xyz_1", "angle_align_xyz_1",
+  # the two components, kept so the composition can be rebuilt or audited
+  "R_xyz", "angle_xyz", "R_align_1", "align_pivot_1",
+  # Stage 3/4 Z translation
+  "t_trans_z_applied",
+  # Stage 4/5 Z-only rotation (applied as +z_rotation_deg, matching Stage 5's 5.1)
+  "z_rotation_deg", "z_rotation_rad",
+  # Stage 5 XY translation - the residual horizontal offset
+  "t_trans_xy",
+  # final pair set that produced the transforms (reporting)
+  "pairs_stage5"
+)
+.stage6_optional <- c(
+  # reporting-only chain + context; absent on some builds
+  "pairs_stage1", "pairs_stage2", "pairs_ax_fitted", "pairs_stage4",
+  "R_rot_xyz", "angle_rot_xyz", "t_trans_z"
+)
+
+.stage_load(stage5_rds_path, .stage6_required, .stage6_optional, label = "Stage 5")
+
+cat("\n══ Settings carried in from the earlier stages ════════════════════════════\n")
+if (exists(".report_pivot1")) .report_pivot1()       # <- the rotation origin for the composed transform
+cat(sprintf("pivot2 (post Z-shift):            (%.4f, %.4f, %.4f)\n",
+            pivot2[1], pivot2[2], pivot2[3]))
+cat("\n── Solved transform components ───────────────────────────────────────────\n")
+cat(sprintf("  rough align     (Stage 1A): %.4f deg\n",
+            acos(pmax(-1, pmin(1, (sum(diag(R_align_1)) - 1) / 2))) * 180 / pi))
+cat(sprintf("  XYZ rotation    (Stage 2): %.4f deg\n", angle_xyz))
+cat(sprintf("  composed rough+XYZ        : %.4f deg  <- this is what Step 6.2 applies\n",
+            angle_align_xyz_1))
+cat(sprintf("  Z translation   (Stage 4): %+.4f m (%+.2f cm)\n",
+            t_trans_z_applied, t_trans_z_applied * 100))
+cat(sprintf("  Z-only rotation (Stage 5): %+.4f deg\n", z_rotation_deg))
+cat(sprintf("  XY translation  (Stage 5): dx = %+.5f m, dy = %+.5f m\n",
+            t_trans_xy[1], t_trans_xy[2]))
+cat(sprintf("\nPairs that produced these values: %d%s\n",
+            nrow(pairs_stage5),
+            if (exists("pairs_stage1")) sprintf(" (of %d originally matched)", nrow(pairs_stage1)) else ""))
+```
+
+
+
+## 0.4 Load Point Clouds
+
+```{r}
+#| label: params-load-stage6
+#| code-summary: "Parameters - Read las_1 (the cloud to transform) and report point + TreeID counts"
+
+
+# Only las_1 is needed here – las_2 is the fixed reference epoch and is never
+# transformed, so there is nothing to export for it. It is loaded anyway (behind
+# a toggle) purely so the optional overlay figure at the end can be drawn.
+load_reference_cloud <- FALSE
+
+.par_apply("params-load-stage6")
+```
+
+```{r}
+#| label: load-stage6
+#| code-summary: "Read las_1 (the cloud to transform) and report point + TreeID counts"
+
+las_1 <- readLAS(las_1_path)
+
+las_1 <- lidR::add_lasattribute(
+  las_1,
+  x    = seq_len(nrow(las_1@data)),
+  name = "point_id",
+  desc = "Unique ID for las_1 points"
+)
+
+if (load_reference_cloud) {
+  las_2 <- readLAS(las_2_path)
+}
+
+# Keep an untouched copy of the raw cloud. The default export writes every
+# original point of las_1, regardless of segmentation.
+las_1_raw <- las_1
+
+.tid_1 <- las_1@data$TreeID
+cat(sprintf("las_1: %s points | %d unique TreeID values (NA and 0 not counted)\n",
+            format(nrow(las_1@data), big.mark = ","),
+            length(unique(.tid_1[!is.na(.tid_1) & .tid_1 != 0L]))))
+cat(sprintf("  points with TreeID = 0 : %s\n",
+            format(sum(.tid_1 == 0L, na.rm = TRUE), big.mark = ",")))
+cat(sprintf("  points with TreeID = NA: %s\n",
+            format(sum(is.na(.tid_1)), big.mark = ",")))
+cat("  All of these are included in the export.\n")
+
+if (load_reference_cloud) {
+  cat(sprintf("las_2 (reference, never transformed): %s points\n",
+              format(nrow(las_2@data), big.mark = ",")))
+}
+```
+
+# Stage 6 - Compose, Apply Export
+
+## 6.1 Select the Transformations to Apply
+
+```{r}
+#| label: params-select-transformations
+#| code-summary: "Parameters - Which solved components to apply, and which source cloud to export"
+
+
+# ── Transformation toggles ───────────────────────────────────────────────────
+# Each component can be disabled independently as a diagnostic. Exporting with
+# exactly one enabled isolates that component's effect; exporting with all
+# disabled writes an untransformed copy, which is a useful null case for
+# checking the export path itself.
+apply_xyz_rotation   <- TRUE    # Stage 1A rough align + Stage 2 R_xyz, composed
+
+apply_z_rotation     <- TRUE    # Stage 4/5 Z-only yaw, about pivot1 (XY)
+apply_xy_translation <- TRUE    # Stage 5 t_trans_xy
+apply_z_translation  <- TRUE    # Stage 4 t_trans_z_applied
+
+# ── Which cloud to export ──────────────────────────────────────────
+# "raw"      -> the point cloud exactly as read from las_1_path, every point
+#               retained. This is the default and, in the current pipeline, the
+#               only meaningful setting: no stage filters the cloud any more, so
+#               las_1 and las_1_raw hold the same points.
+# "filtered" -> the in-memory las_1. Kept as a hook for a run that deliberately
+#               subsets the cloud before this stage; identical to "raw" otherwise.
+#
+# Declared HERE rather than in the export step: Step 6.4 reads it when it picks
+# the source cloud, which runs BEFORE the export chunk that used to define it.
+export_source <- "raw"          # "raw" or "filtered"
+
+.par_apply("params-select-transformations")
+```
+
+```{r}
+#| label: select-transformations
+#| code-summary: "Which solved components to apply, and which source cloud to export"
+#| code-fold: false
+
+
+```
+
+## 6.2 Compose the Rotation
+
+`R_xyz` alone is **not** the rotation that carries a raw on-disk `las_1` into the
+final frame. Stage 1A verticalised `las_1` in memory (`R_align_1`) and never
+wrote it back, and `R_xyz` was then solved *in that aligned frame*. Stage 2
+composed the two into `R_align_xyz_1` / `t_align_xyz_1`, and that pair - not
+`R_xyz` - is the raw -> final map. Applying `R_xyz` on its own here would rotate
+the disk cloud by a matrix solved for a cloud it is not, leaving the export in
+neither frame.
+
+Both legs turn about the **same** point: Stage 1A fixes `pivot1` before it
+rotates and does not recompute it, so `align_pivot_1` and `pivot1` are the same
+coordinates and the composition is a pure rotation about that point. The
+translation `t_align_xyz_1` carries is the pivot-recentring term and nothing
+else - no rotation here produces a shift.
+
+Everything is still assembled as 4x4 homogeneous matrices and multiplied once.
+Not because the pivots differ, but because one multiplication is harder to get
+wrong than three sequential recentrings, and because the finished matrix is what
+gets exported for CloudCompare anyway.
+
+```{r}
+#| label: compose-rotation
+#| code-summary: "Compose the Z-only rotation on top of the composed rough + fine XYZ rotation, honouring the toggles"
+
+# ── Leg 1: the composed rough vertical alignment + fine XYZ rotation ─────────
+# R_align_xyz_1 / t_align_xyz_1 come from the Stage 2 composition step:
+#     x_final = R_align_xyz_1 %*% x_raw + t_align_xyz_1
+# which reproduces, in one application to the RAW cloud,
+#     x_aligned = R_align_1 (x_raw     - align_pivot_1) + align_pivot_1
+#     x_final   = R_xyz     (x_aligned - pivot1)        + pivot1
+# with align_pivot_1 == pivot1, so t_align_xyz_1 is purely (p - R p) and this is
+# one rotation about one point, not a rotation plus a shift.
+#
+# If an older checkpoint predates the composition, it is rebuilt here from the
+# components rather than silently falling back to R_xyz alone - the fallback IS
+# the bug this step exists to fix.
+if (exists("R_align_xyz_1") && exists("t_align_xyz_1")) {
+  R_fine <- R_align_xyz_1
+  t_fine <- as.numeric(t_align_xyz_1)
+} else if (exists("R_align_1") && exists("align_pivot_1")) {
+  .pa    <- as.numeric(align_pivot_1)
+  .p1    <- as.numeric(pivot1)
+  if (sqrt(sum((.pa - .p1)^2)) > 1e-3)
+    stop(sprintf(paste0("[6.2] align_pivot_1 and pivot1 differ by %.4f m. Both rotation ",
+                        "legs must turn about the same point; re-run Stage 1A (it must not ",
+                        "recompute pivot1 after rotating) and Stage 2."),
+                 sqrt(sum((.pa - .p1)^2))))
+  R_fine <- R_xyz %*% R_align_1
+  t_fine <- as.numeric(.p1 - R_fine %*% .p1)
+  cat("[6.2] R_align_xyz_1 absent - rebuilt the composition from R_align_1 + R_xyz.\n")
+  rm(.pa, .p1)
+} else {
+  stop("[6.2] Neither R_align_xyz_1 nor R_align_1 / align_pivot_1 is available. ",
+       "This checkpoint predates the rough alignment; re-run Stages 1 and 2 and reload. ",
+       "Applying R_xyz on its own would skip the Stage 1A alignment entirely.")
+}
+
+M_fine <- diag(4)
+if (apply_xyz_rotation) {
+  M_fine[1:3, 1:3] <- R_fine
+  M_fine[1:3, 4]   <- t_fine
+}
+
+# ── Leg 2: the Z-only yaw, with the SAME sign Stage 5 applied ────────────────
+# ang_diff = angle_2 - angle_1 is the rotation carrying las_1 TO las_2, so
+# aligning las_1 onto las_2 applies +z_rotation_deg. Stage 5's 5.1 rotates the
+# centres by exactly this (a = +z_rotation_deg), and Stage 6 MUST rotate the
+# exported cloud the same way - otherwise the cloud and the measured t_trans_xy
+# would live in opposite-yaw frames and the export would be mis-rotated by ~2x
+# the angle.
+#
+# Build the 2x2 block with the EXACT same layout Stage 5's 5.1 uses
+# (nrow = 2, byrow = TRUE) so the two stages apply the identical rotation, not
+# its transpose. NOTE: matrix(c(cos, -sin, sin, cos), 2, 2) with the default
+# column-major fill would produce the TRANSPOSE (the opposite rotation); the
+# byrow = TRUE here is load-bearing and must match Stage 5.
+z_rotation_rad_exp <- z_rotation_deg * pi / 180        # +z_rotation_deg (matches Stage 5 5.1)
+
+Rz_exp <- diag(3)
+Rz_exp[1:2, 1:2] <- matrix(c(cos(z_rotation_rad_exp), -sin(z_rotation_rad_exp),
+                              sin(z_rotation_rad_exp),  cos(z_rotation_rad_exp)),
+                            nrow = 2, byrow = TRUE)
+
+# The yaw acts about pivot1 in XY. Stage 5 rotated about pivot2, but a Z-only
+# translation cannot move a horizontal centre, so pivot2[1:2] == pivot1[1:2] and
+# the two are the same rotation.
+.pz  <- as.numeric(pivot1)
+M_z  <- diag(4)
+if (apply_z_rotation) {
+  M_z[1:3, 1:3] <- Rz_exp
+  M_z[1:3, 4]   <- .pz - Rz_exp %*% .pz
+}
+
+# ── The composed rotation leg: fine first, then the yaw on top ───────────────
+# Order matters: the composed rough+XYZ rotation is what the cloud was carrying
+# when the Z-only rotation was solved, so it goes first.
+M_rot_exp      <- M_z %*% M_fine
+R_combined_exp <- M_rot_exp[1:3, 1:3]
+t_combined_exp <- M_rot_exp[1:3, 4]
+
+angle_combined <- acos(pmax(-1, pmin(1, (sum(diag(R_combined_exp)) - 1) / 2))) * 180 / pi
+
+cat("── Composed rotation ─────────────────────────────────────────────────────\n")
+cat(sprintf("  rough align + XYZ rotation: %s (%.4f deg, composed)\n",
+            if (apply_xyz_rotation) "ON " else "OFF",
+            acos(pmax(-1, pmin(1, (sum(diag(R_fine)) - 1) / 2))) * 180 / pi))
+cat(sprintf("    of which fine XYZ only  : %.4f deg\n", angle_xyz))
+cat(sprintf("  Z-only rotation           : %s (%+.4f deg)\n",
+            if (apply_z_rotation) "ON " else "OFF", z_rotation_deg))
+cat(sprintf("  Combined magnitude        : %.4f deg\n", angle_combined))
+# The translation column here is the pivot-recentring term for a rotation about
+# pivot1 - in UTM coordinates it runs to hundreds of metres for a fraction of a
+# degree. It is NOT a shift and is deliberately not reported as one; the check
+# below is what matters.
+.rot_shift <- max(abs(.shift_about(M_rot_exp, pivot1)))
+cat(sprintf("  Translation induced by the rotation: %.2e m (must be ~0)\n", .rot_shift))
+if (.rot_shift > 1e-6)
+  warning(sprintf(paste0("The composed rotation displaces pivot1 by %.5f m. Some leg is ",
+                         "turning about a pivot the others do not share."), .rot_shift),
+          call. = FALSE)
+cat("\nR_combined_exp:\n")
+print(round(R_combined_exp, 8))
+
+rm(.pz, .rot_shift)
+```
+
+## 6.3 Compose the Translation
+
+```{r}
+#| label: compose-translation
+#| code-summary: "Assemble the XYZ translation vector, honouring the toggles"
+
+t_exp <- c(
+  if (apply_xy_translation) t_trans_xy[1]      else 0,
+  if (apply_xy_translation) t_trans_xy[2]      else 0,
+  if (apply_z_translation)  t_trans_z_applied  else 0
+)
+names(t_exp) <- c("dx", "dy", "dz")
+
+cat("── Composed translation ──────────────────────────────────────────────────\n")
+cat(sprintf("  XY translation: %s (dx = %+.5f, dy = %+.5f m)\n",
+            if (apply_xy_translation) "ON " else "OFF", t_trans_xy[1], t_trans_xy[2]))
+cat(sprintf("  Z  translation: %s (dz = %+.5f m)\n",
+            if (apply_z_translation) "ON " else "OFF", t_trans_z_applied))
+cat(sprintf("  Applied vector: (%+.5f, %+.5f, %+.5f) m\n", t_exp[1], t_exp[2], t_exp[3]))
+```
+
+## 6.4 Apply the Transform
+
+```{r}
+#| label: apply-transform-stage6
+#| code-summary: "Apply the single composed 4x4 transform – every point of the source cloud"
+#| code-fold: false
+
+las_export <- if (identical(export_source, "raw")) las_1_raw else las_1
+
+xyz_orig_exp <- as.matrix(las_export@data[, c("X", "Y", "Z")])
+
+# ── One matrix, applied once ─────────────────────────────────────────────────
+# M_export folds every enabled component into a single homogeneous transform:
+#   M_export = [translation] %*% [Z-only yaw about pivot1] %*% [rough align + XYZ]
+# so no pivot is re-applied here by hand. The pivot IS still in the matrix -
+# every rotation leg was built about pivot1 - which is what keeps this consistent
+# with the geometry the fitting was done on. Rotating a UTM cloud about the
+# coordinate origin would turn a fraction of a degree into a translation of
+# hundreds of metres; none of these legs does that, and the only true
+# translation in M_export is t_exp.
+M_export <- diag(4)
+M_export[1:3, 4] <- t_exp
+M_export <- M_export %*% M_rot_exp
+
+xyz_new_exp <- t(M_export[1:3, 1:3] %*% t(xyz_orig_exp) + M_export[1:3, 4])
+
+cat(sprintf("Transformed %s points (source: %s cloud).\n",
+            format(nrow(xyz_new_exp), big.mark = ","), export_source))
+cat(sprintf("Every rotation leg is about pivot1 = (%.4f, %.4f, %.4f)\n",
+            pivot1[1], pivot1[2], pivot1[3]))
+
+# ── Net displacement summary ─────────────────────────────────────────────────
+.disp <- sqrt(rowSums((xyz_new_exp - xyz_orig_exp)^2))
+cat(sprintf("Net point displacement: min %.4f m | median %.4f m | max %.4f m\n",
+            min(.disp), median(.disp), max(.disp)))
+```
+
+## 6.5 Export
+
+```{r}
+#| label: params-export-aligned-cloud
+#| code-summary: "Parameters - Write the transformed cloud – all points, all trees, including TreeID 0/NA"
+
+
+
+
+# export_source is set in Step 6.1, alongside the transformation toggles, so
+# that Step 6.4 (which reads it) is not depending on a chunk further down.
+
+# ── Output ───────────────────────────────────────────────────────────────────
+output_path <- "C:/Users/ascsh/Documents/1_Artemis/11_PaqLab/115_TreeTimeAlign/Exports/BOSF1_aiiman.las"
+
+# ── The test-sample marker box ───────────────────────────────────────────────
+# A cloud from the test-sample generator carries seventeen extra points: the
+# rotation pivot, eight TargetBox = 1 corners at their truth positions, and
+# eight TargetBox = 2 corners that were moved by the forward transform. Step 6.6
+# scores the run on how close the transformed box 2 lands to box 1. On real data
+# these fields are simply absent and everything below is a no-op.
+box_field_name    <- "TargetBox"
+corner_field_name <- "BoxCorner"
+
+# The box-1 corners are the TRUTH. Transforming them along with everything else
+# would move the reference the run is being judged against, and the exported
+# file would then show two boxes that are both wrong in the same way. With this
+# TRUE they are written back where the generator put them, so the export can be
+# opened on its own and read directly: box 1 = where the corners belong, box 2 =
+# where this run put them, and the gap between the two is the error.
+#
+# It changes nothing in the arithmetic - Step 6.6 works from M_export and the
+# unmoved coordinates either way, never from what was written to disk.
+restore_truth_box <- TRUE
+
+# Add a scalar field so CloudCompare labels the exported points on load.
+add_source_scalar_field <- TRUE
+
+.par_apply("params-export-aligned-cloud")
+```
+
+```{r}
+#| label: export-aligned-cloud
+#| code-summary: "Write the transformed cloud – all points, all trees, including TreeID 0/NA"
+#| code-fold: false
+
+# The batch names this per sample. It has to be read here rather than pushed in:
+# this chunk assigns the path and writes the file, so a driver override applied
+# after the chunk would arrive after the write - which is how every pair of a
+# batch ended up queued behind the one hardcoded name above.
+if (.in_batch())
+  output_path <- .batch_opt(".batch_aligned_las", output_path)
+
+
+las_out        <- las_export
+las_out@data$X <- xyz_new_exp[, 1]
+las_out@data$Y <- xyz_new_exp[, 2]
+las_out@data$Z <- xyz_new_exp[, 3]
+
+# ── The truth corners stay put ───────────────────────────────────────────────
+# Taken from xyz_orig_exp, the snapshot Step 6.4 made BEFORE the transform, not
+# from las_export@data - which shares its storage with las_out and has just been
+# overwritten. Every other point, including the box-2 corners, is transformed.
+.n_box1 <- 0L
+if (isTRUE(restore_truth_box) && box_field_name %in% names(las_out@data)) {
+  .keep <- which(las_out@data[[box_field_name]] == 1L)
+  .n_box1 <- length(.keep)
+  if (.n_box1) {
+    las_out@data$X[.keep] <- xyz_orig_exp[.keep, 1]
+    las_out@data$Y[.keep] <- xyz_orig_exp[.keep, 2]
+    las_out@data$Z[.keep] <- xyz_orig_exp[.keep, 3]
+  }
+  rm(.keep)
+}
+
+# No TreeID-based subsetting happens anywhere in this stage: las_out holds every
+# point of the source cloud, whatever its TreeID, whether or not its tree ever
+# appeared in a kept pair.
+.tid_out <- las_out@data$TreeID
+cat("── Export contents ───────────────────────────────────────────────────────\n")
+cat(sprintf("  Total points          : %s\n", format(nrow(las_out@data), big.mark = ",")))
+cat(sprintf("  Distinct TreeIDs (>0) : %d\n",
+            length(unique(.tid_out[!is.na(.tid_out) & .tid_out != 0L]))))
+cat(sprintf("  Points with TreeID = 0: %s\n",
+            format(sum(.tid_out == 0L, na.rm = TRUE), big.mark = ",")))
+cat(sprintf("  Points with TreeID =NA: %s\n",
+            format(sum(is.na(.tid_out)), big.mark = ",")))
+cat(sprintf("  Trees in kept pairs   : %d (a subset – NOT a filter on the export)\n",
+            nrow(pairs_stage5)))
+if (box_field_name %in% names(las_out@data)) {
+  .bx <- las_out@data[[box_field_name]]
+  cat(sprintf("  Marker box            : %d truth corner(s)%s | %d transformed corner(s)\n",
+              sum(.bx == 1L, na.rm = TRUE),
+              if (isTRUE(restore_truth_box)) " left at truth" else " ALSO transformed",
+              sum(.bx == 2L, na.rm = TRUE)))
+  rm(.bx)
+}
+
+if (add_source_scalar_field) {
+  # A constant extra LAS attribute; CloudCompare surfaces extra attributes as
+  # named scalar fields, which makes the two epochs easy to tell apart once
+  # both are loaded in the same viewer.
+  las_out <- lidR::add_lasattribute(
+    las_out,
+    x    = rep(1L, nrow(las_out@data)),
+    name = "Aligned",
+    desc = "Aligned"
+  )
+}
+
+# Interactively, never overwrite - a rerun parks itself at _001. In a batch the
+# sample name already makes the path unique, and the driver records THIS path in
+# the report, so a silent _001 would make the report point at the previous run's
+# file. The pair's own file is overwritten instead.
+if (!.in_batch()) output_path <- .unique_path(output_path)
+writeLAS(las_out, output_path)
+
+cat(sprintf("\nSaved %s points -> %s\n",
+            format(nrow(xyz_new_exp), big.mark = ","), output_path))
+```
+
+### Data - Applied-Transformation Summary
+
+```{r}
+#| label: transform-summary-stage6
+#| code-summary: "Final summary: the nine quantities that describe what was applied"
+
+# ── Where the numbers come from ──────────────────────────────────────────────
+# Every quantity below is read off M_export - the single matrix Step 6.4
+# actually applied - rather than off the individual stage outputs. Those are
+# reported too, in the provenance block, but they are not the summary: a stage
+# value that never made it into the composition (because its toggle was off, or
+# because it was superseded) would otherwise appear here as though it had been
+# applied.
+#
+# ONE SET OF SHIFT FIGURES, and it is t_exp. No rotation in this pipeline
+# induces a translation:
+#
+#   - the Stage 1A rough alignment and the Stage 2 fine XYZ rotation turn about
+#     the SAME point (Stage 1A fixes pivot1 before rotating and never recomputes
+#     it; Step 2.5 asserts the two pivots agree), so their composition is a pure
+#     rotation about that point;
+#   - the Stage 4/5 Z-only rotation turns about pivot2, which differs from pivot1
+#     only in Z - and a vertical offset of the pivot cannot affect a rotation
+#     about the vertical axis. pivot2 is the same place relative to the cloud
+#     after the Z-shift as pivot1 was before it.
+#
+# So the translation columns that appear in M_export are pivot-recentring terms
+# and nothing else. Reporting them as a second, "net" set of shifts would be
+# quoting the pivot's coordinates back as though they were a measurement.
+.rot_applied  <- .decompose_rotation(R_combined_exp)
+.shift_applied <- .shift_specs(t_exp)
+
+cat("\n─── Applied Transformations Summary ─────────────────────────────────────\n")
+cat(sprintf("  toggles: xyz-rot %s | z-rot %s | xy-trans %s | z-trans %s\n",
+            if (apply_xyz_rotation)   "ON " else "OFF",
+            if (apply_z_rotation)     "ON " else "OFF",
+            if (apply_xy_translation) "ON " else "OFF",
+            if (apply_z_translation)  "ON " else "OFF"))
+
+cat("\n  ── Rotation, as applied (from R_combined_exp) ─────────────────────────\n")
+cat(sprintf("    XY rotation magnitude : %10.4f deg   (tilt away from vertical)\n",
+            .rot_applied$xy_mag_deg))
+cat(sprintf("    XY rotation direction : %10s deg   (azimuth the +Z axis leans toward, CCW from +X)\n",
+            if (is.na(.rot_applied$xy_dir_deg)) "n/a" else sprintf("%.4f", .rot_applied$xy_dir_deg)))
+cat(sprintf("    Z rotation (yaw)      : %+10.4f deg   (about vertical, CCW from above)\n",
+            .rot_applied$z_deg))
+cat(sprintf("    full XYZ rotation     : %10.4f deg   (total turn about the matrix's own axis)\n",
+            .rot_applied$total_deg))
+cat(sprintf("    factorisation residual: %.2e (the three angles rebuild the matrix exactly)\n",
+            .rot_applied$rebuild_err))
+
+cat("\n  ── Translation, as applied (t_exp) ────────────────────────────────────\n")
+cat(sprintf("    X-only shift          : %+10.5f m\n",  .shift_applied$x))
+cat(sprintf("    Y-only shift          : %+10.5f m\n",  .shift_applied$y))
+cat(sprintf("    Z-only shift          : %+10.5f m   (%+.2f cm)\n",
+            .shift_applied$z, .shift_applied$z * 100))
+cat(sprintf("    XY shift              : %10.5f m\n",  .shift_applied$xy))
+cat(sprintf("    XYZ shift             : %10.5f m\n",  .shift_applied$xyz))
+
+# Cross-check, not a second report: re-expressing M_export as "rotate about
+# pivot1, then shift" must return t_exp. If it does not, a rotation somewhere in
+# the composition has picked up a pivot of its own and is smuggling in a
+# translation - exactly the failure the one-pivot rule exists to prevent.
+.shift_check <- max(abs(.shift_about(M_export, pivot1) - as.numeric(t_exp)))
+cat(sprintf("    (M_export re-expressed about pivot1 returns t_exp to %.2e m -\n",
+            .shift_check))
+cat("     confirming no rotation in the composition induced a shift)\n")
+if (.shift_check > 1e-6)
+  warning(sprintf(paste0("The composed transform carries %.5f m of translation beyond t_exp. ",
+                         "A rotation is turning about a pivot the others do not share - check ",
+                         "Stage 1A.4 (pivot1 must not be recomputed) and Step 2.5."),
+                  .shift_check), call. = FALSE)
+
+cat("\n  ── Provenance: what each stage reported ───────────────────────────────\n")
+cat(sprintf("    Stage 1A rough align  : %10.4f deg about pivot1\n",
+            acos(pmax(-1, pmin(1, (sum(diag(R_align_1)) - 1) / 2))) * 180 / pi))
+cat(sprintf("    Stage 2 fine XYZ      : %10.4f deg about pivot1 (IRLS-SVD)\n", angle_xyz))
+cat(sprintf("    Stage 1A + 2 composed : %10.4f deg (R_align_xyz_1)\n", angle_align_xyz_1))
+if (exists("tilt_dir_deg") && !is.na(tilt_dir_deg))
+  cat(sprintf("      Stage 2 data-derived tilt direction: %.2f deg (consistency %.4f)\n",
+              tilt_dir_deg, tilt_consistency))
+cat(sprintf("    Stage 4 Z translation : %+10.5f m\n", t_trans_z_applied))
+cat(sprintf("    Stage 4/5 Z rotation  : %+10.4f deg (line-network solve)\n", z_rotation_deg))
+cat(sprintf("    Stage 5 XY translation: dx %+.5f m, dy %+.5f m\n",
+            t_trans_xy[1], t_trans_xy[2]))
+
+cat("\n  ── Frame and output ───────────────────────────────────────────────────\n")
+cat(sprintf("    rotation pivot        : (%.4f, %.4f, %.4f)  [pivot1; every leg]\n",
+            pivot1[1], pivot1[2], pivot1[3]))
+cat(sprintf("    export source         : %s cloud, %s points, all TreeIDs incl. 0/NA\n",
+            export_source, format(nrow(xyz_new_exp), big.mark = ",")))
+cat(sprintf("    output                : %s\n", output_path))
+cat("─────────────────────────────────────────────────────────────────────────\n")
+
+# ── 4x4 homogeneous form, for CloudCompare / external tools ──────────────────
+# This is the matrix Step 6.4 actually applied - not a second, independently
+# assembled copy of it. Its translation column already folds in every pivot
+# recentring term for pivot1, so it is expressed in world coordinates and can be
+# pasted straight into an external tool. Its translation column is NOT the shift -
+# the shift is t_exp, reported above.
+
+cat("\nEquivalent 4x4 homogeneous transform (world coordinates):\n")
+print(format(M_export, digits = 12))
+```
+
+### Vis - final alignment check
+
+```{r}
+#| label: fig-final-alignment-3D
+#| fig-cap: "Paired stems after the full composed transform, overlaid on the reference epoch."
+
+if (params$make_plots && exists("las_2") && nrow(pairs_stage5) > 0L) {
+
+  inspect_z_min_final   <- 1
+  inspect_z_max_final   <- 5
+  points_per_tree_final <- 1000
+
+  las1_final <- data.frame(
+    X = xyz_new_exp[, 1], Y = xyz_new_exp[, 2], Z = xyz_new_exp[, 3],
+    TreeID = las_export@data$TreeID
+  )
+  las1_final <- las1_final[!is.na(las1_final$TreeID) & las1_final$TreeID != 0L, ]
+
+  las2_final <- data.frame(
+    X = las_2@data$X, Y = las_2@data$Y, Z = las_2@data$Z,
+    TreeID = las_2@data$TreeID
+  )
+  las2_final <- las2_final[!is.na(las2_final$TreeID) & las2_final$TreeID != 0L, ]
+
+  extract_slice_final <- function(df, tree_ids) {
+    df <- df[df$TreeID %in% tree_ids, ]
+    df |>
+      dplyr::group_by(TreeID) |>
+      dplyr::mutate(Z_rel = Z - min(Z)) |>
+      dplyr::filter(Z_rel >= inspect_z_min_final, Z_rel <= inspect_z_max_final) |>
+      dplyr::ungroup()
+  }
+
+  inspect_1_final <- extract_slice_final(las1_final, pairs_stage5$TreeID_1) |>
+    dplyr::mutate(cloud = "las_1 (all transforms)")
+  inspect_2_final <- extract_slice_final(las2_final, pairs_stage5$TreeID_2) |>
+    dplyr::mutate(cloud = "las_2")
+
+  inspect_df_final <- dplyr::bind_rows(inspect_1_final, inspect_2_final) |>
+    dplyr::group_by(cloud, TreeID) |>
+    dplyr::group_modify(~ {
+      n_pts  <- nrow(.x)
+      n_take <- min(points_per_tree_final, n_pts)
+      .x[sample.int(n_pts, n_take, replace = FALSE), ]
+    }) |>
+    dplyr::ungroup()
+
+  cat("Inspection points (final):", nrow(inspect_df_final), "\n")
+
+  cx_f <- mean(inspect_df_final$X)
+  cy_f <- mean(inspect_df_final$Y)
+  inspect_df_final <- inspect_df_final |>
+    dplyr::mutate(X_local = X - cx_f, Y_local = Y - cy_f)
+
+  plot_ly(
+    data   = inspect_df_final,
+    x = ~X_local, y = ~Y_local, z = ~Z,
+    color  = ~cloud,
+    colors = c("las_1 (all transforms)" = COL_1, "las_2" = COL_2),
+    type   = "scatter3d", mode = "markers",
+    marker = list(size = 2, opacity = 0.6),
+    text   = ~paste0("TreeID: ", TreeID, "<br>Cloud: ", cloud),
+    hoverinfo = "text"
+  ) |>
+    layout(
+      title = sprintf("Temporal pairs after all transforms (1-5 m slice, %d pairs)",
+                      nrow(pairs_stage5)),
+      scene = list(
+        xaxis = list(title = "X local (m)"),
+        yaxis = list(title = "Y local (m)"),
+        zaxis = list(title = "Z (m)"),
+        aspectmode = "data"
+      ),
+      legend = list(title = list(text = "Cloud"))
+    )
+}
+```
+
+## 6.6 Alignment Error Against a Known Truth
+
+Only meaningful on a **generated test sample** - one built by the test-sample
+generator from a perfectly aligned baseline, where the correct answer was
+recorded before the pipeline ever saw the cloud. On real data there is no truth
+to compare against and this step should stay switched off.
+
+The targets are read straight out of the generator's CSV. Nothing is retyped:
+the exact target rotation matrix (`target_R_*`) and the truth pivot
+(`pivot_shifted_*`) come from the file, so the comparison never depends on
+angles that were rounded for display, and a mismatch between the sample on disk
+and the truth being scored against it is impossible as long as the right CSV is
+named.
+
+Two things this does *not* do, both deliberate.
+
+**It does not subtract reported angles.** Comparing a recovered tilt of 0.58 deg
+against a target of 0.59 deg and calling the difference 0.01 deg is wrong
+whenever more than one axis is involved, because rotations about different axes
+do not add or subtract. The error is the *residual rotation*
+$R_{\text{err}} = R_{\text{recovered}} R_{\text{target}}^{\top}$ - literally what
+is left unrotated once the pipeline's answer has been applied. A perfect run
+makes it the identity, and its tilt, yaw and total angle are all zero together
+exactly when the run was right, which a difference of angles is not.
+
+**It does not compare raw translation columns.** In UTM coordinates the
+translation column of a world-frame 4x4 is dominated by pivot-recentring terms
+running to hundreds of metres, and it changes completely if the pivot moves even
+when the transform is identical. Both transforms are therefore re-expressed as
+"rotate about the truth pivot, then shift", and those shifts are what get
+compared. The truth pivot is the one the generator turned the sample about - not
+`pivot1`, unless Step 0.7 was set to read the same CSV, in which case they
+coincide and the intermediate stage printouts become directly readable against
+the truth as well.
+
+**The primary shift measurement is the marker box, not the matrix.** The
+generator plants eight points at the vertices of the reference cloud's bounding
+box twice over: once at their truth positions (`TargetBox = 1`) and once moved
+by the forward transform (`TargetBox = 2`), with `BoxCorner` 1-8 identifying
+which vertex is which on both copies. This step puts the box-2 corners through
+`M_export` - the exact matrix Step 6.4 applied to the cloud - and differences
+each against its box-1 twin. That is a displacement in metres measured on
+geometry the pipeline never saw, and no pivot convention, no factorisation and
+no choice of frame enters it.
+
+The residual is defined as the user specified it: the per-corner differences are
+averaged **as vectors**, one average per offset type (X, Y, Z, XY, XYZ), and the
+*magnitude of the average vector* is the residual. Averaging before taking the
+magnitude is deliberate - it measures the net displacement of the box as a body,
+which is what a shift error is - but it has one consequence worth stating
+plainly, because it is not a defect to be fixed so much as a property to know:
+
+> A rotation error about the centre of the box moves every corner and averages
+> to **exactly zero**. Simulated on a 60 x 45 x 35 m box, a 0.05 deg yaw error
+> displaces all eight corners by 3.26 cm and returns an XYZ residual of 0.00000 m.
+
+So the averaged residuals answer "did the box end up in the right place", and
+the rotation error terms answer "did it end up in the right attitude" - they are
+complementary and neither substitutes for the other. The per-corner distances
+are recorded alongside (`box_percorner_mean_m`, `box_percorner_max_m`, and one
+column per corner), and those do *not* cancel: on that same simulated yaw error
+they read 3.26 cm. If the averaged residuals are near zero and the per-corner
+distances are not, the box is in the right place and turned the wrong way.
+
+Corners are read from the generator's CSV when it carries them, because those
+coordinates are exact; the copies inside the `.las` went through the file's
+scale factor and are quantised. The cloud's own `TargetBox` field is the
+fallback.
+
+Alongside the error terms, the exported row carries the run's own provenance -
+every rotation matrix in the composition, and the pair counts recorded by
+`run_counts` at each filter. That is what turns a folder of these CSVs into
+something answerable: *did the runs that lost most of their pairs at the
+straightness gate also come out worst?*
+
+```{r}
+#| label: params-alignment-error-vs-truth
+#| code-summary: "Parameters - Score this run against the generator's truth CSV and write a full result row"
+
+
+score_against_truth <- FALSE
+
+# The generator's truth CSV for the sample this run processed.
+truth_csv_path <- "C:/Users/ascsh/Documents/1_Artemis/11_PaqLab/115_TreeTimeAlign/TestSamples/Generated/SNBG_BOS_F1_Feb2020_March2026_ULS_TLS.csv"
+
+# Result rows are written one per run and never overwritten (.unique_path).
+result_csv_dir <- "C:/Users/ascsh/Documents/1_Artemis/11_PaqLab/115_TreeTimeAlign/TestSamples/Results"
+
+.par_apply("params-alignment-error-vs-truth")
+```
+
+```{r}
+#| label: alignment-error-vs-truth
+#| code-summary: "Score this run against the generator's truth CSV and write a full result row"
+#| eval: false
+
+# Scoring the run against the truth is the POINT of a batch, so all three are
+# taken from the driver here. The chunk carries eval: false and FALSE defaults
+# for interactive use, and the driver force-evaluates it - but the switch and
+# the paths have to be read inside the chunk, because it uses them in the same
+# chunk that sets them. Pushed in as an after-override they landed too late,
+# leaving score_against_truth FALSE: the chunk ran, did nothing, built no
+# alignment_result, and every pair was reported as no_result.
+if (.in_batch()) {
+  score_against_truth <- isTRUE(.batch_opt(".batch_score_truth", TRUE))
+  truth_csv_path      <- .batch_opt(".batch_truth_csv",  truth_csv_path)
+  result_csv_dir      <- .batch_opt(".batch_results_dir", result_csv_dir)
+}
+
+if (isTRUE(score_against_truth)) {
+
+  # ── 1. Read the truth ──────────────────────────────────────────────────────
+  if (!file.exists(truth_csv_path))
+    stop("[6.6] Generator truth CSV not found:\n  ", truth_csv_path)
+  truth <- utils::read.csv(truth_csv_path, stringsAsFactors = FALSE)
+  if (nrow(truth) != 1L)
+    stop(sprintf("[6.6] Truth CSV has %d rows; expected exactly 1. Subset it to the sample this run used.",
+                 nrow(truth)))
+
+  .nm <- sprintf("target_R_%d%d", rep(1:3, each = 3), rep(1:3, 3))
+  .need <- c(.nm, "target_shift_x_m", "target_shift_y_m", "target_shift_z_m",
+             "pivot_shifted_x", "pivot_shifted_y", "pivot_shifted_z")
+  if (!all(.need %in% names(truth)))
+    stop("[6.6] The CSV is missing columns this step needs (target_R_*, target_shift_*, ",
+         "pivot_shifted_*). It is not a generator truth file, or it predates the current generator.")
+
+  R_target    <- matrix(as.numeric(unlist(truth[1, .nm])), nrow = 3, byrow = TRUE)
+  t_target    <- c(truth$target_shift_x_m, truth$target_shift_y_m, truth$target_shift_z_m)
+  truth_pivot <- c(truth$pivot_shifted_x,  truth$pivot_shifted_y,  truth$pivot_shifted_z)
+
+  if (!isTRUE(all.equal(t(R_target) %*% R_target, diag(3),
+                        tolerance = 1e-6, check.attributes = FALSE)))
+    stop("[6.6] The target rotation read from the CSV is not a rotation matrix - the file is corrupt.")
+
+  # Reported, not enforced: the pipeline may legitimately have chosen its own
+  # pivot. But if Step 0.7 was set to "csv" these coincide, and a large offset
+  # when they were meant to coincide means the wrong CSV is named here.
+  .pivot_gap <- sqrt(sum((as.numeric(pivot1) - truth_pivot)^2))
+
+  # ── 2. Rotation error, from the residual rotation ──────────────────────────
+  R_recovered <- R_combined_exp
+  R_err       <- R_recovered %*% t(R_target)
+  .e_rot <- .decompose_rotation(R_err)
+  .t_rot <- .decompose_rotation(R_target)
+  .r_rot <- .decompose_rotation(R_recovered)
+
+  # ── 3. Shift error, both transforms referred to the truth pivot ────────────
+  s_recovered <- .shift_about(M_export, truth_pivot)
+  .d          <- s_recovered - t_target
+  .rs <- .shift_specs(s_recovered); .ts <- .shift_specs(t_target)
+
+  # XY and XYZ errors are the length of the error VECTOR, not the difference of
+  # the two lengths. Two shifts of equal length pointing different ways would
+  # otherwise score zero error, which is the opposite of the truth.
+  .es <- list(x = .d[1], y = .d[2], z = .d[3],
+              xy = sqrt(sum(.d[1:2]^2)), xyz = sqrt(sum(.d^2)))
+
+  # ── 4. End-to-end residual ─────────────────────────────────────────────────
+  # Rotation error and shift error folded together: where a point actually lands
+  # versus where it should have. This is what a reader sees on opening the two
+  # clouds, and it is the number to quote if only one is quoted.
+  T_target <- diag(4)
+  T_target[1:3, 1:3] <- R_target
+  T_target[1:3, 4]   <- as.numeric(truth_pivot - R_target %*% truth_pivot + t_target)
+
+  .at <- function(M, p) as.numeric(M[1:3, 1:3] %*% p + M[1:3, 4])
+  .resid_pivot <- sqrt(sum((.at(M_export, truth_pivot) - .at(T_target, truth_pivot))^2))
+
+  .resid_rms <- NA_real_; .resid_max <- NA_real_
+  if (exists("xyz_orig_exp")) {
+    .a  <- t(M_export[1:3, 1:3] %*% t(xyz_orig_exp) + M_export[1:3, 4])
+    .b  <- t(T_target[1:3, 1:3] %*% t(xyz_orig_exp) + T_target[1:3, 4])
+    .dd <- sqrt(rowSums((.a - .b)^2))
+    .resid_rms <- sqrt(mean(.dd^2)); .resid_max <- max(.dd)
+    rm(.a, .b, .dd)
+  }
+
+  # ── 4b. Marker-box residuals - the primary shift measurement ───────────────
+  # Two sources, in order of preference:
+  #   csv -> box1_c1_x ... box2_c8_z, the exact coordinates the generator used
+  #   las -> the TargetBox / BoxCorner fields in the cloud, quantised by the
+  #          file's scale factor (sub-millimetre, but it is a real difference and
+  #          the report says which source it used)
+  # Absent from both -> every box_* column comes out NA and the transform-based
+  # terms above stand alone. That is the case on any real, non-generated sample.
+  .bfld <- if (!is.null(truth$box_field_name)) as.character(truth$box_field_name) else
+           if (exists("box_field_name")) box_field_name else "TargetBox"
+  .cfld <- if (!is.null(truth$corner_field_name)) as.character(truth$corner_field_name) else
+           if (exists("corner_field_name")) corner_field_name else "BoxCorner"
+
+  box_corners_truth <- NULL; box_corners_moved <- NULL
+  box_corner_ids    <- integer(0)
+  .box_source       <- "none"
+
+  .b1nm <- sprintf("box1_c%d_%s", rep(1:8, each = 3), rep(c("x", "y", "z"), 8))
+  .b2nm <- sprintf("box2_c%d_%s", rep(1:8, each = 3), rep(c("x", "y", "z"), 8))
+
+  if (all(c(.b1nm, .b2nm) %in% names(truth))) {
+    box_corners_truth <- matrix(as.numeric(unlist(truth[1, .b1nm])), ncol = 3, byrow = TRUE)
+    box_corners_moved <- matrix(as.numeric(unlist(truth[1, .b2nm])), ncol = 3, byrow = TRUE)
+    box_corner_ids    <- 1:8
+    .box_source       <- "csv"
+
+  } else if (exists("las_1_raw") &&
+             all(c(.bfld, .cfld) %in% names(las_1_raw@data))) {
+    .bt <- as.data.frame(las_1_raw@data)[, c("X", "Y", "Z", .bfld, .cfld)]
+    names(.bt) <- c("X", "Y", "Z", "box", "corner")
+    .m1 <- .bt[!is.na(.bt$box) & .bt$box == 1L, ]
+    .m2 <- .bt[!is.na(.bt$box) & .bt$box == 2L, ]
+
+    # Matched on the corner ID, never on proximity - a badly wrong run is exactly
+    # the case where the nearest box-1 corner to a moved box-2 corner is not its
+    # twin, so pairing by distance would flatter the very runs it should punish.
+    if (nrow(.m1) > 0L && nrow(.m1) == nrow(.m2) &&
+        !anyDuplicated(.m1$corner) && setequal(.m1$corner, .m2$corner)) {
+      .m1 <- .m1[order(.m1$corner), ]; .m2 <- .m2[order(.m2$corner), ]
+      box_corners_truth <- as.matrix(.m1[, c("X", "Y", "Z")])
+      box_corners_moved <- as.matrix(.m2[, c("X", "Y", "Z")])
+      dimnames(box_corners_truth) <- NULL; dimnames(box_corners_moved) <- NULL
+      box_corner_ids    <- as.integer(.m1$corner)
+      .box_source       <- "las"
+    } else if (nrow(.m1) > 0L || nrow(.m2) > 0L) {
+      warning(sprintf(paste0("[6.6] The cloud carries %d %s = 1 and %d %s = 2 point(s) but they do ",
+                             "not pair up one-to-one on %s. Marker residuals skipped."),
+                      nrow(.m1), .bfld, nrow(.m2), .bfld, .cfld), call. = FALSE)
+    }
+    rm(.bt, .m1, .m2)
+  }
+
+  .box_ok    <- !is.null(box_corners_truth)
+  box_res    <- list(x = NA_real_, y = NA_real_, z = NA_real_,
+                     xy = NA_real_, xyz = NA_real_)
+  box_mean_vec  <- c(NA_real_, NA_real_, NA_real_)
+  box_percorner <- numeric(0)
+  box_delta     <- NULL
+  box_recovered <- NULL
+
+  if (.box_ok) {
+    # The same matrix Step 6.4 applied to every point of the cloud, applied to
+    # the exact corner coordinates rather than to their quantised copies.
+    box_recovered <- t(M_export[1:3, 1:3] %*% t(box_corners_moved) + M_export[1:3, 4])
+
+    # Per-corner difference vectors: where this run put the corner, minus where
+    # it belongs. Sign convention matches the shift errors above (recovered
+    # minus reference), so a positive dx means the run overshot in +X.
+    box_delta    <- box_recovered - box_corners_truth
+    box_mean_vec <- colMeans(box_delta)
+
+    # Average the VECTORS, then take the magnitude - not the other way round.
+    # X, Y and Z are one-component vectors, so their magnitude is an absolute
+    # value; XY and XYZ take the length of the averaged 2- and 3-vectors.
+    box_res <- list(x   = abs(box_mean_vec[1]),
+                    y   = abs(box_mean_vec[2]),
+                    z   = abs(box_mean_vec[3]),
+                    xy  = sqrt(sum(box_mean_vec[1:2]^2)),
+                    xyz = sqrt(sum(box_mean_vec^2)))
+
+    # Per-corner distances, which do NOT cancel. A rotation error about the box
+    # centre averages to zero above and shows up here, so the two together say
+    # both where the box landed and how it is turned.
+    box_percorner <- sqrt(rowSums(box_delta^2))
+  }
+
+  # ── 5. Report ──────────────────────────────────────────────────────────────
+  .fd <- function(v) if (is.null(v) || is.na(v)) "n/a" else sprintf("%.4f", v)
+
+  cat("\n═══ Alignment error against the known truth ══════════════════════════════\n")
+  cat(sprintf("  sample     : %s\n", truth$sample_name))
+  cat(sprintf("  truth pivot: (%.4f, %.4f, %.4f)   pivot1 offset from it: %.4f m\n\n",
+              truth_pivot[1], truth_pivot[2], truth_pivot[3], .pivot_gap))
+  cat("  ── Marker-box residuals (the primary shift measurement) ───────────────\n")
+  if (!.box_ok) {
+    cat("    no marker box in this sample - the transform-based terms below stand alone\n")
+  } else {
+    cat(sprintf("    %d corner(s), coordinates from the %s\n", nrow(box_delta),
+                if (identical(.box_source, "csv")) "generator CSV (exact)"
+                else "cloud's marker fields (LAS-quantised)"))
+    cat(sprintf("\n    %-8s %12s %12s %12s %14s\n",
+                "corner", "dx (m)", "dy (m)", "dz (m)", "distance (m)"))
+    for (.bi in seq_len(nrow(box_delta)))
+      cat(sprintf("    %-8d %12.5f %12.5f %12.5f %14.5f\n",
+                  box_corner_ids[.bi], box_delta[.bi, 1], box_delta[.bi, 2],
+                  box_delta[.bi, 3], box_percorner[.bi]))
+    cat(sprintf("    %-8s %12.5f %12.5f %12.5f %14s\n", "mean",
+                box_mean_vec[1], box_mean_vec[2], box_mean_vec[3], "-"))
+
+    cat(sprintf("\n    X residual  : %.5f m        (|mean dx|)\n",   box_res$x))
+    cat(sprintf("    Y residual  : %.5f m        (|mean dy|)\n",     box_res$y))
+    cat(sprintf("    Z residual  : %.5f m        (|mean dz|)\n",     box_res$z))
+    cat(sprintf("    XY residual : %.5f m        (length of the mean XY vector)\n",  box_res$xy))
+    cat(sprintf("    XYZ residual: %.5f m        (length of the mean XYZ vector)\n", box_res$xyz))
+    cat(sprintf("\n    per-corner distance: mean %.5f m | max %.5f m\n",
+                mean(box_percorner), max(box_percorner)))
+    # The floor keeps this quiet on a perfect run, where both numbers are
+    # floating-point noise and the ratio between them means nothing.
+    if (mean(box_percorner) > 1e-4 && box_res$xyz < 0.5 * mean(box_percorner))
+      cat("    NOTE: the averaged residual is well below the per-corner distances, so the\n",
+          "         corners are moving in opposing directions - the box is close to the\n",
+          "         right place but turned the wrong way. Read the rotation errors below.\n", sep = "")
+  }
+
+  cat("\n  ── Transform-based error terms (recorded alongside) ───────────────────\n")
+  cat(sprintf("  %-28s %13s %13s %13s\n", "", "recovered", "target", "error"))
+  cat(sprintf("  %-28s %13.4f %13.4f %13.4f\n", "XY rotation magnitude (deg)",
+              .r_rot$xy_mag_deg, .t_rot$xy_mag_deg, .e_rot$xy_mag_deg))
+  cat(sprintf("  %-28s %13s %13s %13s\n", "XY rotation direction (deg)",
+              .fd(.r_rot$xy_dir_deg), .fd(.t_rot$xy_dir_deg), .fd(.e_rot$xy_dir_deg)))
+  cat(sprintf("  %-28s %13.4f %13.4f %13.4f\n", "Z rotation (deg)",
+              .r_rot$z_deg, .t_rot$z_deg, .e_rot$z_deg))
+  cat(sprintf("  %-28s %13.4f %13.4f %13.4f\n", "full XYZ rotation (deg)",
+              .r_rot$total_deg, .t_rot$total_deg, .e_rot$total_deg))
+  cat(sprintf("  %-28s %13.5f %13.5f %13.5f\n", "X-only shift (m)", .rs$x,  .ts$x,  .es$x))
+  cat(sprintf("  %-28s %13.5f %13.5f %13.5f\n", "Y-only shift (m)", .rs$y,  .ts$y,  .es$y))
+  cat(sprintf("  %-28s %13.5f %13.5f %13.5f\n", "Z-only shift (m)", .rs$z,  .ts$z,  .es$z))
+  cat(sprintf("  %-28s %13.5f %13.5f %13.5f\n", "XY shift (m)",     .rs$xy, .ts$xy, .es$xy))
+  cat(sprintf("  %-28s %13.5f %13.5f %13.5f\n", "XYZ shift (m)",    .rs$xyz, .ts$xyz, .es$xyz))
+  cat("\n  (the XY and XYZ error entries are the length of the error vector, not the\n")
+  cat("   difference of the two lengths - equal-length shifts pointing different ways\n")
+  cat("   are not a zero error)\n")
+
+  cat("\n  ── End-to-end residual ────────────────────────────────────────────────\n")
+  cat(sprintf("    at the truth pivot     : %.5f m\n", .resid_pivot))
+  if (!is.na(.resid_rms))
+    cat(sprintf("    over the exported cloud: RMS %.5f m | max %.5f m\n", .resid_rms, .resid_max))
+  cat("    (the rotation error acts on a lever arm, so the plot edge moves further than\n")
+  cat("     the pivot does - the max is the worst case a reader will see)\n")
+
+  # ── 6. Provenance: the matrices and the pair counts ────────────────────────
+  # Every rotation in the composition, kept separately. A run can be wrong
+  # because the rough alignment was wrong, because the fine solve was wrong, or
+  # because they composed badly, and only the separate matrices distinguish
+  # those three.
+  .flat <- function(M, prefix) {
+    v  <- as.vector(t(M))
+    nm <- as.vector(t(outer(seq_len(nrow(M)), seq_len(ncol(M)),
+                            function(i, j) sprintf("%s_%d%d", prefix, i, j))))
+    stats::setNames(as.list(v), nm)
+  }
+
+  # Same, but for a 3x3 that a checkpoint may predate: emits the identical nine
+  # column names filled with NA rather than dropping them, so a folder of result
+  # rows from different pipeline versions still rbinds.
+  .flat_opt <- function(nm_obj, prefix) {
+    if (exists(nm_obj, envir = .stage_env(), inherits = FALSE) &&
+        is.matrix(get(nm_obj, envir = .stage_env())))
+      .flat(get(nm_obj, envir = .stage_env()), prefix)
+    else .flat(matrix(NA_real_, 3, 3), prefix)
+  }
+  .val_opt <- function(nm_obj, default = NA) {
+    if (exists(nm_obj, envir = .stage_env(), inherits = FALSE))
+      get(nm_obj, envir = .stage_env()) else default
+  }
+
+  # run_counts is built up by .tally() across Stages 1-5 and travels in the
+  # checkpoints. Read through a helper so a checkpoint that predates the tally
+  # yields NA columns rather than stopping the report.
+  .rc <- if (exists("run_counts")) run_counts else list()
+  .cnt <- function(k) { v <- .rc[[k]]; if (is.null(v)) NA else v }
+
+  result <- c(
+    list(
+      # ── identity ────────────────────────────────────────────────────────
+      sample_name         = truth$sample_name,
+      scored_utc          = format(Sys.time(), tz = "UTC", usetz = TRUE),
+      truth_csv           = truth_csv_path,
+      aligned_las         = if (exists("output_path")) output_path else NA_character_,
+      toggles             = sprintf("xyzrot=%s;zrot=%s;xytrans=%s;ztrans=%s",
+                                    apply_xyz_rotation, apply_z_rotation,
+                                    apply_xy_translation, apply_z_translation),
+
+      # ── frames ──────────────────────────────────────────────────────────
+      truth_pivot_x       = truth_pivot[1],
+      truth_pivot_y       = truth_pivot[2],
+      truth_pivot_z       = truth_pivot[3],
+      pivot1_x            = as.numeric(pivot1)[1],
+      pivot1_y            = as.numeric(pivot1)[2],
+      pivot1_z            = as.numeric(pivot1)[3],
+      pivot1_mode         = if (exists("pivot1_mode")) pivot1_mode else NA_character_,
+      pivot1_offset_m     = .pivot_gap,
+      # Recorded so a run where the two pivots drifted apart is identifiable
+      # after the fact; it should be 0 on every correct run.
+      pivot_leg_gap_m     = sqrt(sum((as.numeric(align_pivot_1) - as.numeric(pivot1))^2)),
+
+      # ── (1) APPLIED: what this run actually did ─────────────────────────
+      applied_rot_xy_mag_deg = .r_rot$xy_mag_deg,
+      applied_rot_xy_dir_deg = .r_rot$xy_dir_deg,
+      applied_rot_z_deg      = .r_rot$z_deg,
+      applied_rot_total_deg  = .r_rot$total_deg,
+      applied_shift_x_m      = .rs$x,
+      applied_shift_y_m      = .rs$y,
+      applied_shift_z_m      = .rs$z,
+      applied_shift_xy_m     = .rs$xy,
+      applied_shift_xyz_m    = .rs$xyz,
+
+      # ── (2) REFERENCE: what a perfect run would have done ───────────────
+      reference_rot_xy_mag_deg = .t_rot$xy_mag_deg,
+      reference_rot_xy_dir_deg = .t_rot$xy_dir_deg,
+      reference_rot_z_deg      = .t_rot$z_deg,
+      reference_rot_total_deg  = .t_rot$total_deg,
+      reference_shift_x_m      = .ts$x,
+      reference_shift_y_m      = .ts$y,
+      reference_shift_z_m      = .ts$z,
+      reference_shift_xy_m     = .ts$xy,
+      reference_shift_xyz_m    = .ts$xyz,
+
+      # ── (3) ERROR ───────────────────────────────────────────────────────
+      err_rot_xy_mag_deg  = .e_rot$xy_mag_deg,
+      err_rot_xy_dir_deg  = .e_rot$xy_dir_deg,
+      err_rot_z_deg       = .e_rot$z_deg,
+      err_rot_total_deg   = .e_rot$total_deg,
+      err_shift_x_m       = .es$x,
+      err_shift_y_m       = .es$y,
+      err_shift_z_m       = .es$z,
+      err_shift_xy_m      = .es$xy,
+      err_shift_xyz_m     = .es$xyz,
+      resid_at_pivot_m    = .resid_pivot,
+      resid_cloud_rms_m   = .resid_rms,
+      resid_cloud_max_m   = .resid_max,
+
+      # ── (3b) MARKER-BOX RESIDUALS - the primary shift measurement ────────
+      # box_res_* are the magnitudes of the corner-averaged difference vectors.
+      # box_mean_d* are the same averages kept signed, so a systematic offset
+      # keeps its direction when a folder of these rows is stacked.
+      box_source          = .box_source,
+      box_n_corners       = if (.box_ok) nrow(box_delta) else NA_integer_,
+      box_mean_dx_m       = box_mean_vec[1],
+      box_mean_dy_m       = box_mean_vec[2],
+      box_mean_dz_m       = box_mean_vec[3],
+      box_res_x_m         = box_res$x,
+      box_res_y_m         = box_res$y,
+      box_res_z_m         = box_res$z,
+      box_res_xy_m        = box_res$xy,
+      box_res_xyz_m       = box_res$xyz,
+      # These do not cancel, and are what distinguishes a displaced box from a
+      # rotated one.
+      box_percorner_mean_m = if (.box_ok) mean(box_percorner) else NA_real_,
+      box_percorner_max_m  = if (.box_ok) max(box_percorner)  else NA_real_,
+
+      # ── (8-17) how many things survived each filter ─────────────────────
+      n_treeids_1           = .cnt("n_treeids_1"),          # (8)  unique TreeIDs, las_1
+      n_treeids_2           = .cnt("n_treeids_2"),          # (8)  unique TreeIDs, las_2
+      n_pairs_original      = .cnt("n_pairs_original"),     # (9)  Stage 1 matched pairs
+      irls_stem_group       = .cnt("irls_stem_group"),      # (10) "consensus" or "all"
+      n_pairs_gate_passed   = .cnt("n_pairs_gate_passed"),
+      n_pairs_irls_in       = .cnt("n_pairs_irls_in"),      # (11) pairs entering the IRLS-SVD
+      n_pairs_irls_kept     = .cnt("n_pairs_irls_kept"),    # (11) survivors of the residual filter
+      ztrans_mode           = .cnt("ztrans_mode"),
+      n_pairs_ztrans_set    = .cnt("n_pairs_ztrans_set"),
+      n_pairs_ztrans_topup  = .cnt("n_pairs_ztrans_topup"),
+      n_pairs_stage3_in     = .cnt("n_pairs_stage3_in"),    # (12) entering 3.1
+      n_pairs_pair_avg      = .cnt("n_pairs_pair_avg"),     # (13) given a per-pair average (3.15)
+      n_pairs_stage4_in     = .cnt("n_pairs_stage4_in"),    # (14) entering Stage 4
+      n_pairs_zoverlap_kept = .cnt("n_pairs_zoverlap_kept"),
+      n_stems_lines_start   = .cnt("n_stems_lines_start"),
+      n_stems_lines_kept    = .cnt("n_stems_lines_kept"),
+      n_pairs_lines_kept    = .cnt("n_pairs_lines_kept"),   # (15) after inter-stem line filtering
+      n_pairs_stage5_in     = .cnt("n_pairs_stage5_in"),    # (16) entering Stage 5
+      n_pairs_xy_kept       = .cnt("n_pairs_xy_kept")       # (17) after XY displacement filtering
+    ),
+    # ── (4-7) every rotation in the composition, flattened row-major ───────
+    # Which rotations Stage 1A actually applied, and the round-trip error proving
+    # R_rough is their composition. NA-filled on a checkpoint that predates them.
+    list(
+      rough_sideways          = .val_opt("align_sideways", NA),
+      rough_sideways_rotated  = .val_opt("align_sideways_rotated", NA),
+      rough_sideways_probed   = .val_opt("align_sw_probed", NA),
+      rough_orientation       = .val_opt("align_orientation", NA_character_),
+      rough_ud_confident      = .val_opt("align_ud_confident", NA),
+      rough_check_max_err_m   = .val_opt("align_check_max_err", NA_real_)
+    ),
+    .flat_opt("R_sideways_yaw", "R_rough_yaw"),   # 45 deg sideways probe, if kept
+    .flat_opt("R_sideways_90",  "R_rough_tip90"), # 90 deg sideways tip, if applied
+    .flat_opt("R_residual",     "R_rough_resid"), # verticalisation of the forest axis
+    .flat(R_align_1,      "R_rough"),      # (4) Stage 1A rough vertical alignment
+    .flat(R_xyz,          "R_fine"),       # (5) Stage 2 fine XYZ solve
+    .flat(R_align_xyz_1,  "R_rough_fine"), # (6) rough + fine, composed (Stage 2 §2.5)
+    .flat(R_combined_exp, "R_full"),       # (7) rough + fine + Z-only, as exported
+    .flat(R_target,       "R_reference"),
+    .flat(R_err,          "R_error"),
+    .flat(M_export,       "M_applied"),
+    .flat(T_target,       "M_reference"),
+    # One column per corner: the distance that corner ended up from its truth
+    # position. NA-filled when the sample carries no box, so the column set is
+    # the same width on every run and a folder of these still rbinds.
+    stats::setNames(
+      as.list(if (.box_ok) box_percorner else rep(NA_real_, 8L)),
+      sprintf("box_c%d_dist_m",
+              if (.box_ok) box_corner_ids else 1:8))
+  )
+
+  alignment_result <- as.data.frame(result, stringsAsFactors = FALSE)
+
+  cat("\n  ── Pairs surviving each filter ────────────────────────────────────────\n")
+  cat(sprintf("    unique TreeIDs      : las_1 %s | las_2 %s\n",
+              .cnt("n_treeids_1"), .cnt("n_treeids_2")))
+  cat(sprintf("    original pairs      : %s\n", .cnt("n_pairs_original")))
+  cat(sprintf("    IRLS-SVD (%s group): %s in -> %s kept\n",
+              .cnt("irls_stem_group"), .cnt("n_pairs_irls_in"), .cnt("n_pairs_irls_kept")))
+  cat(sprintf("    Stage 3 Z-translation: %s in -> %s averaged (3.15)\n",
+              .cnt("n_pairs_stage3_in"), .cnt("n_pairs_pair_avg")))
+  cat(sprintf("    Stage 4             : %s in -> %s after line filtering\n",
+              .cnt("n_pairs_stage4_in"), .cnt("n_pairs_lines_kept")))
+  cat(sprintf("    Stage 5             : %s in -> %s after XY filtering\n",
+              .cnt("n_pairs_stage5_in"), .cnt("n_pairs_xy_kept")))
+  if (length(.rc) == 0L)
+    cat("    (run_counts is empty - this checkpoint predates the tally; re-run from Stage 1)\n")
+
+  # ── 7. Export ──────────────────────────────────────────────────────────────
+  # One wide row per run, so a folder of these stacks with rbind and joins onto
+  # the generator's truth table on sample_name.
+  dir.create(result_csv_dir, recursive = TRUE, showWarnings = FALSE)
+  result_csv_path <- file.path(result_csv_dir, paste0(truth$sample_name, "_result.csv"))
+  # As with the aligned cloud: unique names by hand, one file per sample in a
+  # batch. A rerun of a pair should replace that pair's row, not leave a _001
+  # beside it for the reader to date-sort.
+  if (!.in_batch()) result_csv_path <- .unique_path(result_csv_path)
+  utils::write.csv(alignment_result, result_csv_path, row.names = FALSE)
+  cat(sprintf("\nSaved %d result column(s) -> %s\n", ncol(alignment_result), result_csv_path))
+  cat("═════════════════════════════════════════════════════════════════════════\n")
+
+  rm(.nm, .need, .e_rot, .t_rot, .r_rot, .d, .rs, .ts, .es, .at,
+     .resid_pivot, .resid_rms, .resid_max, .fd, .flat, .rc, .cnt, .pivot_gap,
+     .bfld, .cfld, .b1nm, .b2nm, .box_ok, .box_source)
+}
+```
+
+Workflow complete
+
+No checkpoint is written by Stage 6 – its output is the exported `.las` file
+itself. To re-export with a different combination of components, change the
+toggles in Step 6.1 and re-run from Step 6.2; nothing upstream needs to be
+recomputed.
