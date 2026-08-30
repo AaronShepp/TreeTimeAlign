@@ -132,7 +132,7 @@ The threshold is therefore the half-width of an inlier band around the candidate
 The number of hypotheses drawn is adaptive rather than fixed. When `iter_per_point` is set, the budget is
 
 $$
-\text{clamp}\big(\text{iter\_per\_point} \times n_{\text{points}},\; \text{iter\_min},\; \text{iter\_max}\big),
+\text{clamp}\big(\text{iter per point} \times n_{\text{points}},\; \text{iter min},\; \text{iter max}\big),
 $$
 
 so a sparse slice is not given the same effort as a dense one, and no slice can consume unbounded time. A fixed `n_iterations` is available as an alternative.
