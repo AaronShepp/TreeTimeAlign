@@ -132,7 +132,7 @@ The threshold is therefore the half-width of an inlier band around the candidate
 The number of hypotheses drawn is adaptive rather than fixed. When `iter_per_point` is set, the budget is
 
 $$
-\operatorname{clamp}\big(\texttt{iter\_per\_point} \times n_{\text{points}},\; \texttt{iter\_min},\; \texttt{iter\_max}\big),
+\text{clamp}\big(\text{iter\_per\_point} \times n_{\text{points}},\; \text{iter\_min},\; \text{iter\_max}\big),
 $$
 
 so a sparse slice is not given the same effort as a dense one, and no slice can consume unbounded time. A fixed `n_iterations` is available as an alternative.
@@ -292,21 +292,16 @@ Every signal is a per-slice scalar, computed in each stem's own local frame wher
 | `ecc` | $\sqrt{1 - (b/a)^2}$, eccentricity, zero for a circular section and approaching one as the section flattens |
 | `center_offset` | The perpendicular distance of the fitted ellipse centre from the stem axis, $\sqrt{c_x^2 + c_y^2}$ in the local frame. It measures how far the section sits off the axis rather than the shape of the section, so it responds to a stem that wanders where the shape signals do not |
 
-**Eight protrusion signals.** The five signals above all describe the fitted ellipse, and none of them says anything about the points the ellipse did *not* capture. That is where a branch stub, a bark plate or a buttress lives. The protrusion signals fill that gap: the axis-orthogonal plane is cut into eight sectors, and each records the fraction of that sector's points lying outside the fitted ellipse.
-
-There are eight rather than one because the position of a protrusion around the stem is the informative part. A single fraction-outside would average a one-sided bulge away to nothing.
+**Eight protrusion signals.** The five signals above all describe the fitted ellipse, and none of them says anything about the points the ellipse did *not* capture. Protrusion is meant to capture the lack of uniformity including bulges and indents. The axis-orthogonal plane is cut into eight sectors, and each records the fraction of that sector's points lying outside the fitted ellipse.
 
 **The sector frame**
-The sectors lie in the plane perpendicular to the pair axis, so they are *not* horizontal and their labels are *not* compass directions; N, NE, E and so on are used only because eight labelled directions read more easily than indices. North is defined as the in-plane direction with the greatest global $Z$ component, that is, the projection of the global $Z$ axis onto the orthogonal plane. This depends only on the pair axis, so both stems of a pair receive the same sector boundaries and their signals can be compared slice for slice. Anchoring on anything derived from the points themselves, such as the widest radius or the first principal direction, would let the two epochs rotate independently and destroy that comparability. The remaining seven directions sit at 45° intervals turning right-handed about the axis, and the sectors are the wedges between adjacent directions, so no point can fall in two.
+The sectors lie in the plane perpendicular to the pair axis, so they are *not* horizontal and their labels are *not* compass directions; N, NE, E and so on are used only because eight labelled directions read more easily than indices. North is defined as the in-plane direction with the greatest global $Z$ component. This depends only on the pair axis, so both stems of a pair receive the same sector boundaries and their signals can be compared slice for slice. The remaining seven directions sit at 45° intervals clockwise about the axis, and the sectors are the wedges between adjacent directions.
 
 **The mask**
 Counting every point in the slice window would count leaves: a slice cut through a crown catches foliage metres from the stem, all of it outside the fitted ellipse, so a leafy stem would read as protruding in every direction at once and the signal would measure canopy density rather than stem shape. Each slice is therefore masked by its own fitted ellipse scaled by a factor, 1.3 by default. The mask is elliptical rather than circular because the ellipse is what the points are being scored against; a circular mask on a flattened section would admit more of the plane along the minor axis than the major one and bias the sectors accordingly. The same mask is applied to every slice, refit or not, so that two slices' protrusion values are always computed under comparable masks.
 
-**The apex**
-The wedges radiate from the fitted ellipse centre by default, so a bulge lands in the wedge it bulges into, measured from the shape it is bulging out of. Radiating from the stem axis instead is available, and is the better choice where the fits themselves are unstable, since the axis does not move when a fit wobbles.
-
 **Reading the values**
-A point counts as outside when its radial excess exceeds a tolerance, zero by default. Zero is the literal definition, and it has a consequence worth knowing: the fit places the ellipse *through* the point cloud, so roughly half the inlier shell sits marginally outside it and every sector starts from a baseline near 0.5. These values should be read as departures from about 0.5 rather than from 0. The baseline is shared by both epochs and cancels in the comparison. Setting the tolerance to the fit's own distance threshold instead measures the fraction outside the fitted *shell*, which starts near 0 and responds only to genuine protrusions.
+A point counts as outside when its radial excess exceeds a tolerance, zero by default. Setting the tolerance to the fit's own distance threshold instead measures the fraction outside the fitted *shell*.
 
 **Minimum points**
 A sector with fewer than three points returns `NA` rather than a fraction, since a quotient over one or two points swings between 0 and 1 on noise and would look like a measurement.
