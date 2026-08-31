@@ -155,9 +155,9 @@ Both epochs then take the *scarcer* epoch's $t$. They must be fitted identically
 |---|---|---|
 | Slice thickness | 5 cm | 20 cm |
 | Distance threshold | 5 mm | 15 mm |
-| Consensus fraction, centre | base | 1.00 |
-| Consensus fraction, semi-minor | base | 0.60 |
-| Consensus fraction, semi-major | base | 0.60 |
+| Consensus fraction, centre | 0.3 | 1.00 |
+| Consensus fraction, semi-minor | 0.3 | 0.60 |
+| Consensus fraction, semi-major | 0.3 | 0.60 |
 
 The base values are the TLS settings. The distance threshold cap is deliberately held at three times the base rather than ramped further, for the reason given above: widening the inlier band past a certain fraction of the stem radius cannot recover a slice that does not contain a resolvable cross-section, and an over-wide band shows up downstream as inflated semi-axes.
 
