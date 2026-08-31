@@ -1,6 +1,6 @@
 # TreeTimeAlign
 
-### A stem-based workflow for intertemporal co-registration of TLS forest point clouds
+### A stem-based workflow for intertemporal alignment of TLS forest point clouds
 
 **Aaron Sheppard**
 
